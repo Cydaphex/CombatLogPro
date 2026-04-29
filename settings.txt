@@ -1,0 +1,9 @@
+{
+    btnX = 528,
+    btnY = 609,
+    liveX = 9,
+    liveW = 340,
+    scanFreq = 200,
+    liveH = 320,
+    liveY = 274,
+}
