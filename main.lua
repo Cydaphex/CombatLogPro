@@ -35,7 +35,7 @@ local addon = {
     name = "CombatLogPro",
     author = "Cydaphex",
     desc = "Combat Log with separated heal tracking and debuff scanner",
-    version = "46.0" -- patch 243 API integration
+    version = "1.0.0" -- patch 243 API integration
 }
 
 -- [[ COMPATIBILITY PATCH ]] --
