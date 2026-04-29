@@ -2,20 +2,20 @@ local api = require("api")
 
 -- [[ LOAD STATIC DATA ]] --
 local buffDB = {}
-local dbLoaded, staticData = pcall(require, "/Combat_Log_pro/static_buff_list")
+local dbLoaded, staticData = pcall(require, "/CombatLogPro/static_buff_list")
 if dbLoaded and staticData then
     buffDB = staticData
     api.Log:Info("[CLP] Static Buff Database Loaded.")
 end
 
-local skillTypesLoaded, skillTypesData = pcall(require, "/Combat_Log_pro/skill_damage_types")
+local skillTypesLoaded, skillTypesData = pcall(require, "/CombatLogPro/skill_damage_types")
 if skillTypesLoaded and skillTypesData then
     api.Log:Info("[CLP] Skill damage type database loaded.")
 else
     api.Log:Info("[CLP] WARNING: skill_damage_types.lua failed to load. Using fallback table.")
 end
 
-local skillDataLoaded, SKILL_DATA = pcall(require, "/Combat_Log_pro/skill_data")
+local skillDataLoaded, SKILL_DATA = pcall(require, "/CombatLogPro/skill_data")
 if skillDataLoaded and SKILL_DATA then
     api.Log:Info("[CLP] Skill data database loaded.")
 else
@@ -23,7 +23,7 @@ else
     api.Log:Info("[CLP] WARNING: skill_data.lua failed to load.")
 end
 
-local combosLoaded, SKILL_COMBOS = pcall(require, "/Combat_Log_pro/skill_combos")
+local combosLoaded, SKILL_COMBOS = pcall(require, "/CombatLogPro/skill_combos")
 if combosLoaded and SKILL_COMBOS then
     api.Log:Info("[CLP] Skill combos database loaded.")
 else
@@ -35,7 +35,7 @@ local addon = {
     name = "CombatLogPro",
     author = "Cydaphex",
     desc = "Combat Log with separated heal tracking and debuff scanner",
-    version = "1.0.0" -- patch 243 API integration
+    version = "1.0.1" -- patch 243 API integration
 }
 
 -- [[ COMPATIBILITY PATCH ]] --
@@ -206,7 +206,7 @@ local CONFIG = {
     SCAN_PLAYER_BUFFS = false, -- set true to continuously log buffs/debuffs applied to player (no duplicates)
     LOG_UNKNOWN_INCOMING = false, -- log first occurrence of each incoming ability to incoming_abilities.txt; notify in live log if unclassified
     FILTER_STATIC_SHOCK = true, -- hide sessions where the only damage is passive procs (Electric Shock, etc.)
-    DEBUG_LOG_EVENTS    = false, -- set true to dump all event params to Combat_Log_pro/event_log.txt
+    DEBUG_LOG_EVENTS    = false, -- set true to dump all event params to CombatLogPro/event_log.txt
     DEBUG_ZERO_HITS     = false, -- set true to dump target buff names on unexplained 0-damage hits (find mount/glider buff names)
 }
 
@@ -282,23 +282,23 @@ local lastTargetBuffCount = -1  -- used to skip re-scan when buff count unchange
 -- Buff scanner state (SCAN_TARGET_BUFFS)
 local seenBuffIds = {}
 local buffScanLoaded = false
-local buffScanFile = "Combat_Log_pro/target_buffs.txt"
+local buffScanFile = "CombatLogPro/target_buffs.txt"
 
 -- Player buff/debuff scanner state (SCAN_PLAYER_BUFFS)
 local seenPlayerBuffIds = {}
 local playerBuffScanLoaded = false
-local playerBuffScanFile = "Combat_Log_pro/player_buffs.txt"
+local playerBuffScanFile = "CombatLogPro/player_buffs.txt"
 
 -- Incoming ability logger state (LOG_UNKNOWN_INCOMING)
 local seenIncomingSkills = {}
 local incomingSkillLoaded = false
-local incomingSkillFile = "Combat_Log_pro/incoming_abilities.txt"
+local incomingSkillFile = "CombatLogPro/incoming_abilities.txt"
 
 -- Last cast skill from SPELLCAST_SUCCEEDED (patch 243+) for pre-classification
 local lastPlayerCast = nil
 
 -- Event debug log (written to file when DEBUG_LOG_EVENTS = true)
-local eventLogFile = "Combat_Log_pro/event_log.txt"
+local eventLogFile = "CombatLogPro/event_log.txt"
 local eventLogLines = {}
 local function LogEventToFile(event, args)
     local parts = { tostring(api.Time:GetUiMsec()) .. " " .. tostring(event) }
@@ -350,7 +350,7 @@ local cachedTimestamp = "[..:..:..] "  -- updated once per OnUpdate tick
 local frameNow = 0                     -- api.Time:GetUiMsec() cached per frame
 
 -- Settings & Position Persistence
-local SETTINGS_FILE = "Combat_Log_pro/settings.txt"
+local SETTINGS_FILE = "CombatLogPro/settings.txt"
 local savedSettings = {}
 
 local function LoadSavedSettings()
@@ -681,8 +681,8 @@ local function GetOrCreateOutgoing(unitID, targetName, now)
         dump("target_UnitInfo",          targetInfo)
         dump("target_skillset_probe",    probeSkillsets(targetInfo))
         dump("target_UnitModInfo",       targetModInfo)
-        pcall(function() api.File:Write("Combat_Log_pro/unitinfo_dump.txt", table.concat(lines, "\n")) end)
-        api.Log:Info("[CLP] DEBUG_UNITINFO dump written to Combat_Log_pro/unitinfo_dump.txt")
+        pcall(function() api.File:Write("CombatLogPro/unitinfo_dump.txt", table.concat(lines, "\n")) end)
+        api.Log:Info("[CLP] DEBUG_UNITINFO dump written to CombatLogPro/unitinfo_dump.txt")
         CONFIG.DEBUG_UNITINFO = false  -- dump once per reload
     end
 
@@ -2005,9 +2005,9 @@ local function OnLiveEvent(self, event, ...)
                 table.insert(dumpLines, string.format("  args[%d] = %s", i, tostring(v)))
             end
             table.insert(dumpLines, "")
-            local ok2, existing = pcall(function() return api.File:Read("Combat_Log_pro/parse_dump.txt") end)
+            local ok2, existing = pcall(function() return api.File:Read("CombatLogPro/parse_dump.txt") end)
             local prev = (ok2 and existing and existing ~= "") and (existing .. "\n") or ""
-            pcall(function() api.File:Write("Combat_Log_pro/parse_dump.txt", prev .. table.concat(dumpLines, "\n")) end)
+            pcall(function() api.File:Write("CombatLogPro/parse_dump.txt", prev .. table.concat(dumpLines, "\n")) end)
         end
 
         -- COMBAT: damage or CC from COMBAT_MSG also triggers combat (backup for game event)
@@ -2693,7 +2693,7 @@ local function OnLiveUpdate(self, dt)
                 local b = api.Unit:UnitBuff("player", i)
                 if b then buffData[i] = b end
             end
-            api.File:Write("Combat_Log_pro/buff_dump.txt", buffData)
+            api.File:Write("CombatLogPro/buff_dump.txt", buffData)
             LogEntry(string.format("[DUMP] %d player buffs written to buff_dump.txt", count), 0, 1, 0)
         end
 
@@ -3185,7 +3185,7 @@ local function Load()
     wButton:RegisterEvent("SPELLCAST_START")          -- patch 243+: cast began
     wButton:RegisterEvent("SPELLCAST_SUCCEEDED")      -- patch 243+: cast completed
     wButton:RegisterEvent("SPELLCAST_STOP")           -- patch 243+: cast interrupted/cancelled
-    LogEntry("CombatLogPro v46.0 Loaded (" .. PLAYER_NAME .. ")", 0, 1, 0)
+    LogEntry("CombatLogPro v1.0.1 Loaded (" .. PLAYER_NAME .. ")", 0, 1, 0)
 end
 
 local function Unload()
