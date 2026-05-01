@@ -4,7 +4,14 @@ local api = require("api")
 local buffDB = {}
 local dbLoaded, staticData = pcall(require, "/CombatLogPro/static_buff_list")
 if dbLoaded and staticData then
-    buffDB = staticData
+    local allBuffs = staticData.ALL_BUFFS or staticData
+    if type(allBuffs) == "table" then
+        for _, entry in ipairs(allBuffs) do
+            if entry.id and entry.name then
+                buffDB[entry.id] = entry.name
+            end
+        end
+    end
     api.Log:Info("[CLP] Static Buff Database Loaded.")
 end
 
@@ -188,11 +195,13 @@ local CONFIG = {
     LINE_HEIGHT = 18,
     COMBAT_WAIT = 4000,
     DOT_WAIT = 3000,
-    COL_OUT_NRM = "Orange",
-    COL_OUT_CRIT = "Red",
-    COL_INCOMING = "Orange",
-    COL_HEAL = "Green",
-    COL_CC   = "Purple",
+    COL_OUT_NRM    = {1, 0.5, 0},     -- Orange
+    COL_OUT_CRIT   = {1, 0, 0},       -- Red
+    COL_INCOMING   = {1, 0.5, 0},     -- Orange
+    COL_HEAL       = {0, 1, 0},       -- Green
+    COL_CC         = {0.8, 0.3, 1},   -- Purple
+    COL_ZEAL_CRIT  = {1, 0.3, 1},     -- Bright purple for Zeal crit damage line
+    COL_SKILL_LABEL= {0, 1, 1},       -- Cyan for skill/ability name lines
     SCAN_FREQ = 200,        -- debuff/buff scanner interval in ms (100=fast, 200=default, 500=low)
     ENABLE_SCANNER = true,
     SHOW_TIMESTAMP = true,
@@ -200,14 +209,16 @@ local CONFIG = {
     DEBUG_UNITINFO  = false, -- set true once to probe UnitInfo magic field names
     DEBUG_EVENTS    = false, -- set true once to discover chat debuff event name
     DEBUG_HITTYPE   = false, -- set true to log raw args for negated hit events (DODGE/BLOCK/MISS/PARRY)
-    DUMP_BUFFS      = false, -- set true once to dump all player buffs to file (activate while Zeal is up)
+    DUMP_BUFFS      = false, -- set true once to dump all player buffs to file (activate while chanty is up)
     DEBUG_PARSE     = false, -- set true to dump all ParseCombatMessage fields to file
     SCAN_TARGET_BUFFS = false, -- set true to continuously log target buffs/debuffs to file (no duplicates)
     SCAN_PLAYER_BUFFS = false, -- set true to continuously log buffs/debuffs applied to player (no duplicates)
     LOG_UNKNOWN_INCOMING = false, -- log first occurrence of each incoming ability to incoming_abilities.txt; notify in live log if unclassified
+    SHOW_HEALS          = true, -- show healing events in log (both live and history)
     FILTER_STATIC_SHOCK = true, -- hide sessions where the only damage is passive procs (Electric Shock, etc.)
     DEBUG_LOG_EVENTS    = false, -- set true to dump all event params to CombatLogPro/event_log.txt
     DEBUG_ZERO_HITS     = false, -- set true to dump target buff names on unexplained 0-damage hits (find mount/glider buff names)
+    DUMP_RHYTHM         = false, -- auto-captures UnitInfo stats at each new Rhythm stack count; set false when done
 }
 
 local PALETTE = {
@@ -249,7 +260,9 @@ local healData = { done = {}, received = {} }
 local healSessionByTarget = {}
 local timeSinceLastAction = 0 
 local inCombat = false
-local PLAYER_NAME = "Unknown" 
+local PLAYER_NAME = "Unknown"
+local PLAYER_UNIT_ID = ""
+local lastIncomingSourceId = nil  -- set by COMBAT_TEXT, consumed by next COMBAT_MSG incoming hit
 local nameCheckTimer = 0 
 
 local activeDebuffsCache = {}
@@ -335,8 +348,28 @@ local targetBuffEffects = {
 
 -- Zeal tracking (buff_id 495)
 local zealActive    = false
+local rhythmDumpLastStacks = -1  -- tracks last seen Rhythm stack count for DUMP_RHYTHM
 local zealStartTime = nil
 local fightZealTime = 0
+
+local chantyActive          = false
+local currentSpellDmgMul    = 0     -- spell_damage_mul from last scanner tick
+local baselineSpellDmgMul   = nil   -- spell_damage_mul when chanty is not active
+local chantySpellBonus       = 0    -- current chanty contribution (current - baseline)
+
+local bulwarkActive         = false
+local currentArmor          = 0
+local currentMagicResist    = 0
+local baselineArmor         = nil
+local baselineMagicResist   = nil
+local bulwarkArmorBonus     = 0
+local bulwarkResistBonus    = 0
+
+local currentSpellDps     = 0
+local currentBattleResist = 0
+local incDmgStats = { spellMul=0, meleeMul=0, rangedMul=0, spellVal=0, meleeVal=0, rangedVal=0 }
+local rhythmStacks          = 0     -- current Rhythm buff stack count
+local RHYTHM_DPS_PER_STACK  = 7.0  -- confirmed from dump: spell_dps rises exactly +7 per stack
 
 -- ParseCombatMessage availability check (done once at load, not per event)
 local _parseCombatMessage = ParseCombatMessage
@@ -357,9 +390,17 @@ local function LoadSavedSettings()
     local data = api.File:Read(SETTINGS_FILE)
     if data and type(data) == "table" then
         savedSettings = data
-        if data.liveW    then CONFIG.LIVE_WIDTH  = data.liveW    end
-        if data.liveH    then CONFIG.LIVE_HEIGHT = data.liveH    end
-        if data.scanFreq then CONFIG.SCAN_FREQ   = data.scanFreq end
+        if data.liveW     then CONFIG.LIVE_WIDTH  = data.liveW    end
+        if data.liveH     then CONFIG.LIVE_HEIGHT = data.liveH    end
+        if data.scanFreq  then CONFIG.SCAN_FREQ   = data.scanFreq end
+        if data.showHeals ~= nil then CONFIG.SHOW_HEALS = data.showHeals end
+        if data.colOutNrm    then CONFIG.COL_OUT_NRM    = data.colOutNrm    end
+        if data.colOutCrit   then CONFIG.COL_OUT_CRIT   = data.colOutCrit   end
+        if data.colInc       then CONFIG.COL_INCOMING   = data.colInc       end
+        if data.colHeal      then CONFIG.COL_HEAL       = data.colHeal      end
+        if data.colCC        then CONFIG.COL_CC         = data.colCC        end
+        if data.colZealCrit  then CONFIG.COL_ZEAL_CRIT  = data.colZealCrit  end
+        if data.colSkillLbl  then CONFIG.COL_SKILL_LABEL= data.colSkillLbl  end
     end
 end
 
@@ -375,9 +416,17 @@ local function SaveSettings()
         s.liveX = x
         s.liveY = y
     end
-    s.liveW    = CONFIG.LIVE_WIDTH
-    s.liveH    = CONFIG.LIVE_HEIGHT
-    s.scanFreq = CONFIG.SCAN_FREQ
+    s.liveW      = CONFIG.LIVE_WIDTH
+    s.liveH      = CONFIG.LIVE_HEIGHT
+    s.scanFreq   = CONFIG.SCAN_FREQ
+    s.showHeals  = CONFIG.SHOW_HEALS
+    s.colOutNrm   = CONFIG.COL_OUT_NRM
+    s.colOutCrit  = CONFIG.COL_OUT_CRIT
+    s.colInc      = CONFIG.COL_INCOMING
+    s.colHeal     = CONFIG.COL_HEAL
+    s.colCC       = CONFIG.COL_CC
+    s.colZealCrit = CONFIG.COL_ZEAL_CRIT
+    s.colSkillLbl = CONFIG.COL_SKILL_LABEL
     pcall(function() api.File:Write(SETTINGS_FILE, s) end)
 end
 
@@ -499,8 +548,9 @@ local function RefreshTimestamp(nowMsec)
 end
 
 local function GetSafeColor(colorName)
+    if type(colorName) == "table" then return colorName end
     if colorName and PALETTE[colorName] then return PALETTE[colorName] end
-    return PALETTE["White"] 
+    return PALETTE["White"]
 end
 
 local function CreateBackdrop(parent, color, layer)
@@ -893,14 +943,17 @@ local function RecordLogForTarget(unitID, unitName, text, r, g, b, meta)
             if logScrollOffset >= (maxOffset - 5) or logScrollOffset < 0 then logScrollOffset = maxOffset end
             histDisplayDirty = true
         end
-        liveBuffer[#liveBuffer + 1] = { text = text, r = r, g = g, b = b, time = ts }
-        liveBuffer = TrimBuffer(liveBuffer, 50)
-        liveRebuildDirty = true
-        local nowMs = api.Time:GetUiMsec()
-        if nowMs - lastLiveRebuildTime >= 50 then
-            lastLiveRebuildTime = nowMs
-            liveRebuildDirty = false
-            RebuildLiveLabels()
+        if not (meta and meta.detailOnly) then
+            local liveTxt = (meta and meta.liveText) or text
+            liveBuffer[#liveBuffer + 1] = { text = liveTxt, r = r, g = g, b = b, time = ts }
+            liveBuffer = TrimBuffer(liveBuffer, 50)
+            liveRebuildDirty = true
+            local nowMs = api.Time:GetUiMsec()
+            if nowMs - lastLiveRebuildTime >= 50 then
+                lastLiveRebuildTime = nowMs
+                liveRebuildDirty = false
+                RebuildLiveLabels()
+            end
         end
     end
     table.insert(currentSessionLogs, histEntry)
@@ -1401,6 +1454,29 @@ local function FinishFight()
         if zealActive and zealStartTime then
             finalZealTime = finalZealTime + (api.Time:GetUiMsec() - zealStartTime)
         end
+        -- Damage breakdown: Base + Crit + Zeal + Chanty = Total
+        local critBonusDmg    = data.critBonusDmg   or 0
+        local chantyBonusDmg2 = data.chantyBonusDmg or 0
+        local zealExtraDmg2   = data.zealExtraDmg   or 0
+        local rhythmBonusDmg  = data.rhythmBonusDmg or 0
+        local totalDealt = (data.magicDmg or 0) + (data.physDmg or 0) + (data.rangedDmg or 0)
+        local baseDmg = math.max(0, totalDealt - critBonusDmg - zealExtraDmg2 - chantyBonusDmg2 - rhythmBonusDmg)
+        if (critBonusDmg > 0 or chantyBonusDmg2 > 0 or zealExtraDmg2 > 0 or rhythmBonusDmg > 0) and duration > 0 then
+            local baseDps = baseDmg / duration
+            local baseColor = { 0.75, 0.75, 0.75 }
+            RecordLogForTarget(id, tName,
+                string.format("  Base: %d dmg (%.0f DPS)", baseDmg, baseDps),
+                baseColor[1], baseColor[2], baseColor[3], { logType = "summary" })
+        end
+        if critBonusDmg > 0 and duration > 0 then
+            local critDps = critBonusDmg / duration
+            local critColor = { 1, 0.85, 0.2 }
+            RecordLogForTarget(id, tName,
+                string.format("  [*] Crit bonus: +%d dmg (+%.0f DPS)",
+                    critBonusDmg, critDps),
+                critColor[1], critColor[2], critColor[3], { logType = "summary" })
+        end
+
         local zealDmg  = data.zealDmg  or 0
         local zealHits = data.zealHits or 0
         local zealExtraDmg = data.zealExtraDmg or 0
@@ -1411,6 +1487,28 @@ local function FinishFight()
                 string.format("  [Z] Zeal crits: +%d bonus dmg (+%.0f DPS)",
                     zealExtraDmg, zealExtraDps),
                 zealColor[1], zealColor[2], zealColor[3], { logType = "summary" })
+        end
+
+        -- Chanty summary
+        local chantyBonusDmg = data.chantyBonusDmg or 0
+        if chantyBonusDmg > 0 and duration > 0 then
+            local chantyDps = chantyBonusDmg / duration
+            local chantyColor = { 0.4, 0.85, 1 }
+            RecordLogForTarget(id, tName,
+                string.format("  [C] Chanty: +%d bonus dmg (+%.0f DPS)",
+                    chantyBonusDmg, chantyDps),
+                chantyColor[1], chantyColor[2], chantyColor[3], { logType = "summary" })
+        end
+
+        -- Rhythm summary
+        local rhythmBonusDmg = data.rhythmBonusDmg or 0
+        if rhythmBonusDmg > 0 and duration > 0 then
+            local rhythmDps = rhythmBonusDmg / duration
+            local rhythmColor = { 0.6, 1, 0.6 }
+            RecordLogForTarget(id, tName,
+                string.format("  [R] Rhythm: +%d bonus dmg (+%.0f DPS)",
+                    rhythmBonusDmg, rhythmDps),
+                rhythmColor[1], rhythmColor[2], rhythmColor[3], { logType = "summary" })
         end
 
         -- Combo summary
@@ -1537,17 +1635,35 @@ local function FinishFight()
     end
 
     -- Reset Zeal state for next fight
-    zealActive    = false
+    -- Don't reset zealActive/chantyActive/bulwarkActive — scanner updates them every tick.
+    -- Resetting here causes missed detection on the first hit of the next fight.
     zealStartTime = nil
     fightZealTime = 0
 
     -- Print Incoming Damage Stats (no heals mixed in)
+    -- Pre-pass: count how many entries share the same display name (same-named PvE mobs)
+    local incomingNameCount = {}
+    local incomingNameIndex = {}
+    for key, data in pairs(fightData.incoming) do
+        local baseName = data.displayName or key
+        incomingNameCount[baseName] = (incomingNameCount[baseName] or 0) + 1
+        incomingNameIndex[baseName] = 0
+    end
+
     for name, data in pairs(fightData.incoming) do
-        RecordLogForTarget(name, name, "--- INCOMING: " .. name .. " ---", 1, 0, 0, { logType = "summary" })
+        local baseName = data.displayName or name
+        local displayName
+        if incomingNameCount[baseName] > 1 then
+            incomingNameIndex[baseName] = incomingNameIndex[baseName] + 1
+            displayName = baseName .. " #" .. incomingNameIndex[baseName]
+        else
+            displayName = baseName
+        end
+        RecordLogForTarget(name, displayName, "--- INCOMING: " .. displayName .. " ---", 1, 0, 0, { logType = "summary" })
 
         local totalDmg = 0
         for skill, dmg in pairs(data.skills or {}) do
-            RecordLogForTarget(name, name, "  < " .. skill .. ": " .. dmg, 1, 0.5, 0.5, { logType = "summary" })
+            RecordLogForTarget(name, displayName, "  < " .. skill .. ": " .. dmg, 1, 0.5, 0.5, { logType = "summary" })
             totalDmg = totalDmg + dmg
         end
         if totalDmg > 0 then
@@ -1566,7 +1682,7 @@ local function FinishFight()
             else
                 totalLine = string.format("  Total DMG: %d taken (%.1fs)", totalDmg, duration)
             end
-            RecordLogForTarget(name, name, totalLine, 1, 0.3, 0.3, { logType = "summary" })
+            RecordLogForTarget(name, displayName, totalLine, 1, 0.3, 0.3, { logType = "summary" })
             if sessionByTarget[name] then
                 sessionByTarget[name].totalDmg = totalDmg
                 sessionByTarget[name].duration = duration
@@ -1582,17 +1698,17 @@ local function FinishFight()
                 local mitColor       = { 0.5, 0.8, 1 }
 
                 if rawMeleeRanged > 0 then
-                    RecordLogForTarget(name, name,
+                    RecordLogForTarget(name, displayName,
                         string.format("  Your armor: %d (%.1f%% base)", defSnap.armor, defSnap.armorPct),
                         mitColor[1], mitColor[2], mitColor[3], { logType = "summary" })
                 end
                 if rawMagic > 0 then
-                    RecordLogForTarget(name, name,
+                    RecordLogForTarget(name, displayName,
                         string.format("  Your magic res: %d (%.1f%% base)", defSnap.resist, defSnap.resistPct),
                         mitColor[1], mitColor[2], mitColor[3], { logType = "summary" })
                 end
                 if defSnap.toughness > 0 then
-                    RecordLogForTarget(name, name,
+                    RecordLogForTarget(name, displayName,
                         string.format("  Your Toughness: %d", defSnap.toughness),
                         mitColor[1], mitColor[2], mitColor[3], { logType = "summary" })
                 end
@@ -1602,7 +1718,7 @@ local function FinishFight()
                     local block = defSnap.block or 0
                     local parry = defSnap.parry or 0
                     if dodge > 0 or block > 0 or parry > 0 then
-                        RecordLogForTarget(name, name,
+                        RecordLogForTarget(name, displayName,
                             string.format("  Your dodge: %.1f%% | Block: %.1f%% | Parry: %.1f%%", dodge, block, parry),
                             mitColor[1], mitColor[2], mitColor[3], { logType = "summary" })
                     end
@@ -1623,10 +1739,21 @@ local function FinishFight()
                 if irv ~= 0 then table.insert(modParts, string.format("Ranged %+d/hit", irv)) end
                 if isv ~= 0 then table.insert(modParts, string.format("Magic %+d/hit", isv)) end
                 if #modParts > 0 then
-                    RecordLogForTarget(name, name,
+                    RecordLogForTarget(name, displayName,
                         "  Modifiers: " .. table.concat(modParts, " | "),
                         mitColor[1], mitColor[2], mitColor[3], { logType = "summary" })
                 end
+            end
+
+            -- Bulwark Ballad summary
+            local bulwarkPrevented = data.bulwarkPrevented or 0
+            if bulwarkPrevented > 0 and duration > 0 then
+                local bulwarkDps = bulwarkPrevented / duration
+                local bulwarkColor = { 0.4, 1, 0.6 }
+                RecordLogForTarget(name, displayName,
+                    string.format("  [B] Ballad prevented: +%d dmg (+%.0f DPS)",
+                        bulwarkPrevented, bulwarkDps),
+                    bulwarkColor[1], bulwarkColor[2], bulwarkColor[3], { logType = "summary" })
             end
         end
 
@@ -1634,6 +1761,7 @@ local function FinishFight()
     end
 
     -- Healing Done Summary (separate green sessions)
+    if CONFIG.SHOW_HEALS then
     local c = GetSafeColor(CONFIG.COL_HEAL)
     for targetName, data in pairs(healData.done) do
         local key = "done_" .. targetName
@@ -1674,8 +1802,10 @@ local function FinishFight()
             end
         end
     end
+    end -- SHOW_HEALS
 
     -- Healing Received Summary (separate green sessions)
+    if CONFIG.SHOW_HEALS then
     for sourceName, data in pairs(healData.received) do
         local key = "recv_" .. sourceName
         RecordHealLog(key, sourceName, "--- HEALED BY: " .. sourceName .. " ---", c[1], c[2], c[3], { logType = "summary" })
@@ -1708,6 +1838,7 @@ local function FinishFight()
             end
         end
     end
+    end -- SHOW_HEALS
 
     LogEntry("---------------------------", 0.5, 0.5, 0.5)
 
@@ -1849,6 +1980,16 @@ end
 -- === EVENT HANDLER ===
 local function OnLiveEvent(self, event, ...)
     local args = { ... }; if #args == 0 and arg then args = arg end
+
+    if event == "COMBAT_TEXT" then
+        local sourceUnitId = tostring(args[1] or "")
+        local targetUnitId = tostring(args[2] or "")
+        if targetUnitId == PLAYER_UNIT_ID and sourceUnitId ~= "" then
+            lastIncomingSourceId = sourceUnitId
+        end
+        return
+    end
+
     if event == "COMBAT_MSG" then
         -- patch 243+: dump all event args to chat for debugging
         if CONFIG.DEBUG_LOG_EVENTS then
@@ -1885,7 +2026,7 @@ local function OnLiveEvent(self, event, ...)
         local now = frameNow  -- cached by OnUpdate, avoids GetUiMsec() per event
 
         -- HEALS: route to separate tracking, never trigger combat
-        if isHeal and absDmg > 0 then
+        if isHeal and absDmg > 0 and CONFIG.SHOW_HEALS then
             local c = GetSafeColor(CONFIG.COL_HEAL)
             if sourceName == PLAYER_NAME then
                 RecordHealLog("done_" .. targetName, targetName, string.format("+ %s -> %s: %d", skill, targetName, absDmg), c[1], c[2], c[3],
@@ -1952,7 +2093,7 @@ local function OnLiveEvent(self, event, ...)
             elseif isDefend               then label = "!Defended"  verb = "blocked"
             else                               label = "!Missed"    verb = "missed"
             end
-            local sc = PALETTE.SkyBlue
+            local sc = GetSafeColor(CONFIG.COL_SKILL_LABEL)
             local missColor = isImmune and { 1, 0.4, 0.1 } or { 0.55, 0.55, 0.55 }
             RecordLogForTarget(unitID, targetName,
                 string.format("%s: %s", skill, targetName),
@@ -2112,7 +2253,7 @@ local function OnLiveEvent(self, event, ...)
                 activeDots[key].hits = activeDots[key].hits + 1
                 local c = GetSafeColor(CONFIG.COL_OUT_NRM)
                 outData.skillTypes[skill] = dmgTag
-                local sc = PALETTE.SkyBlue
+                local sc = GetSafeColor(CONFIG.COL_SKILL_LABEL)
                 RecordLogForTarget(unitID, targetName,
                     string.format("%s (DoT): %s", skill, targetName),
                     sc[1], sc[2], sc[3],
@@ -2137,7 +2278,7 @@ local function OnLiveEvent(self, event, ...)
                 end
                 local c
                 if zealActive and isCrit then
-                    c = { 1, 0.3, 1, 1 }  -- bright purple for zeal crits only
+                    c = GetSafeColor(CONFIG.COL_ZEAL_CRIT)
                 else
                     c = isCrit and GetSafeColor(CONFIG.COL_OUT_CRIT) or GetSafeColor(CONFIG.COL_OUT_NRM)
                 end
@@ -2145,28 +2286,49 @@ local function OnLiveEvent(self, event, ...)
                 -- Line 1: skill + target (backstab annotation here)
                 local bsTag = isBackstab and (bsSkillInfo and " [BS+]" or " [BS]") or ""
                 local skillLine = string.format("%s: %s%s", skill, targetName, bsTag)
-                -- Line 2: damage type + number + hit info (+ Zeal bonus if applicable)
-                local dmgLine
+                -- Compute per-hit bonuses (accumulated into outData, logged as separate colored lines)
+                local zealBonus, chantyBonus, critExtra, rhythmBonus = 0, 0, 0, 0
+                -- Rhythm: additive to spell_dps, computed from current stacks and spell_dps stat
+                if rhythmStacks > 0 and isMagicHit and currentSpellDps > 0 then
+                    local rhythmDpsBonus = rhythmStacks * RHYTHM_DPS_PER_STACK
+                    rhythmBonus = math.floor(absDmg * rhythmDpsBonus / currentSpellDps)
+                    outData.rhythmBonusDmg = (outData.rhythmBonusDmg or 0) + rhythmBonus
+                end
+                -- Chanty is computed first — it's the outermost multiplier and is independent of crit.
+                -- Crit must then be computed from the pre-chanty damage to avoid double-counting.
+                if chantyActive and chantySpellBonus > 0 and isMagicHit then
+                    chantyBonus = math.floor(absDmg * chantySpellBonus / (100 + chantySpellBonus))
+                    outData.chantyBonusDmg = (outData.chantyBonusDmg or 0) + chantyBonus
+                end
+                if isCrit then
+                    local snap = outData.statSnapshot
+                    local critBonusPct = isMagicHit
+                        and (snap and snap.playerSpellCritBonus or 50)
+                        or  (snap and snap.playerMeleeCritBonus or 50)
+                    -- Remove chanty multiplier before computing crit attribution
+                    local preChanty = chantyBonus > 0
+                        and (absDmg - chantyBonus)
+                        or  absDmg
+                    if zealActive then
+                        -- Zeal adds 75% to crit bonus; both share one combined denominator
+                        local denom = 100 + critBonusPct + 75
+                        local critTotal = math.floor(preChanty * (critBonusPct + 75) / denom)
+                        critExtra = math.floor(critTotal * critBonusPct / (critBonusPct + 75))
+                        zealBonus  = critTotal - critExtra  -- remainder avoids rounding drift
+                        outData.zealExtraDmg = (outData.zealExtraDmg or 0) + zealBonus
+                    else
+                        critExtra = math.floor(preChanty * critBonusPct / (100 + critBonusPct))
+                    end
+                    outData.critBonusDmg = (outData.critBonusDmg or 0) + critExtra
+                end
                 if zealActive then
                     outData.zealHits = (outData.zealHits or 0) + 1
-                    if isCrit then
-                        local snap = outData.statSnapshot
-                        local critBonus = snap and (snap.playerSpellCritBonus or snap.playerMeleeCritBonus or 50) or 50
-                        local zealBonus = math.floor(absDmg * 75 / (225 + critBonus))
-                        outData.zealExtraDmg = (outData.zealExtraDmg or 0) + zealBonus
-                        dmgLine = absorbed > 0
-                            and string.format("[%s] %d (%s|%d absorbed) [Zeal +%d]", dmgLabel, absDmg, hitDisplay, absorbed, zealBonus)
-                            or  string.format("[%s] %d (%s) [Zeal +%d]", dmgLabel, absDmg, hitDisplay, zealBonus)
-                    else
-                        dmgLine = absorbed > 0
-                            and string.format("[%s] %d (%s|%d absorbed)", dmgLabel, absDmg, hitDisplay, absorbed)
-                            or  string.format("[%s] %d (%s)", dmgLabel, absDmg, hitDisplay)
-                    end
-                else
-                    dmgLine = absorbed > 0
-                        and string.format("[%s] %d (%s|%d absorbed)", dmgLabel, absDmg, hitDisplay, absorbed)
-                        or  string.format("[%s] %d (%s)", dmgLabel, absDmg, hitDisplay)
                 end
+                -- Base damage = total minus all bonuses
+                local baseDmg = absDmg - critExtra - zealBonus - chantyBonus - rhythmBonus
+                local dmgLine = absorbed > 0
+                    and string.format("[%s] %d (%s|%d absorbed)", dmgLabel, absDmg, hitDisplay, absorbed)
+                    or  string.format("[%s] %d (%s)", dmgLabel, absDmg, hitDisplay)
                 -- Combo detection: build labels, log separately after damage line
                 local isSynergy = parseOk and parseResult and parseResult.synergy == true
                 local comboLabels = {}
@@ -2242,27 +2404,62 @@ local function OnLiveEvent(self, event, ...)
                         outData.comboBonusDmg = (outData.comboBonusDmg or 0) + totalBonus
                     end
                 end
-                local sc = PALETTE.SkyBlue
+                local sc = GetSafeColor(CONFIG.COL_SKILL_LABEL)
                 local cc = { 0.75, 0.5, 1 }  -- soft purple for combo lines
                 RecordLogForTarget(unitID, targetName, skillLine, sc[1], sc[2], sc[3],
                     { logType = "outgoing", skill = skill, source = sourceName, target = targetName, damage = absDmg, absorbed = absorbed, hitType = hitType })
                 RecordLogForTarget(unitID, targetName, dmgLine, c[1], c[2], c[3], nil)
+                if critExtra > 0 or zealBonus > 0 or chantyBonus > 0 or rhythmBonus > 0 then
+                    local parts = { string.format("Base %d", baseDmg) }
+                    if critExtra   > 0 then parts[#parts+1] = string.format("Crit +%d",   critExtra)   end
+                    if zealBonus   > 0 then parts[#parts+1] = string.format("Zeal +%d",   zealBonus)   end
+                    if chantyBonus > 0 then parts[#parts+1] = string.format("Chanty +%d", chantyBonus) end
+                    if rhythmBonus > 0 then parts[#parts+1] = string.format("Rhythm +%d", rhythmBonus) end
+                    RecordLogForTarget(unitID, targetName, "  " .. table.concat(parts, " | "),
+                        0.75, 0.75, 0.75, { detailOnly = true })
+                end
+                -- Outgoing mitigation breakdown: reverse-compute raw from snap, then split toughness + armor/resist
+                do
+                    local snap = outData.statSnapshot
+                    if snap then
+                        local targetToughness = snap.targetToughness or 0
+                        local effectiveDef = isMagicHit
+                            and math.max(0, (snap.targetResist  or 0) - (snap.playerMagicPen or 0))
+                            or  math.max(0, (snap.targetDefense or 0) - (snap.playerPhysPen  or 0))
+                        if targetToughness > 0 then
+                            local computedRaw = math.floor(
+                                absDmg * (targetToughness + 8000) / 8000 * (effectiveDef + 8000) / 8000)
+                            local toughReduction = targetToughness > 0
+                                and math.floor(computedRaw * targetToughness / (targetToughness + 8000))
+                                or  0
+                            local postTough    = computedRaw - toughReduction
+                            local defReduction = math.max(0, postTough - absDmg)
+                            local defLabel     = isMagicHit and "Resist" or "Armor"
+                            local mitParts = { string.format("Raw %d", computedRaw) }
+                            if toughReduction > 0 then mitParts[#mitParts+1] = string.format("Tough -%d", toughReduction) end
+                            if defReduction   > 0 then mitParts[#mitParts+1] = string.format("%s -%d", defLabel, defReduction) end
+                            RecordLogForTarget(unitID, targetName,
+                                "  " .. table.concat(mitParts, " | "),
+                                0.5, 0.5, 0.5, { detailOnly = true })
+                        end
+                    end
+                end
                 if isSynergy then
                     if #comboLabels > 0 then
                         local header = #comboLabels == 1 and "Skill Comboed:" or string.format("Skills Comboed x%d:", #comboLabels)
-                        RecordLogForTarget(unitID, targetName, header, cc[1], cc[2], cc[3], { logType = "combo" })
+                        RecordLogForTarget(unitID, targetName, header, cc[1], cc[2], cc[3], { logType = "combo", detailOnly = true })
                         for _, lbl in ipairs(comboLabels) do
-                            RecordLogForTarget(unitID, targetName, lbl, cc[1], cc[2], cc[3], nil)
+                            RecordLogForTarget(unitID, targetName, lbl, cc[1], cc[2], cc[3], { detailOnly = true })
                         end
                     else
-                        RecordLogForTarget(unitID, targetName, "Skill Comboed", cc[1], cc[2], cc[3], { logType = "combo" })
+                        RecordLogForTarget(unitID, targetName, "Skill Comboed", cc[1], cc[2], cc[3], { logType = "combo", detailOnly = true })
                     end
                 end
             elseif isPlayerAction then
                 if targetBuffEffects.invincible then
                     -- Skill eaten by invincibility (detected via buff scanner)
                     outData.invincibleSkills[skill] = (outData.invincibleSkills[skill] or 0) + 1
-                    local sc = PALETTE.SkyBlue
+                    local sc = GetSafeColor(CONFIG.COL_SKILL_LABEL)
                     RecordLogForTarget(unitID, targetName,
                         string.format("%s: %s", skill, targetName),
                         sc[1], sc[2], sc[3],
@@ -2292,10 +2489,25 @@ local function OnLiveEvent(self, event, ...)
             end
 
         elseif targetName == PLAYER_NAME then
-            if not fightData.incoming[sourceName] then
+            -- Use sourceUnitId from COMBAT_TEXT (fires just before COMBAT_MSG) to
+            -- distinguish same-named mobs in PvE. Falls back to name-only for PvP.
+            local sourceUnitId = lastIncomingSourceId
+            local incomingKey = sourceUnitId and (sourceName .. "|" .. sourceUnitId) or sourceName
+            lastIncomingSourceId = nil
+            -- Check source's toughness to determine if this is a PvP hit (toughness only applies in PvP)
+            local incSourceToughness = 0
+            if sourceUnitId then
+                local okSrc, srcInfo = pcall(function() return api.Unit:UnitInfo(sourceUnitId) end)
+                if okSrc and srcInfo then
+                    incSourceToughness = tonumber(srcInfo.battle_resist or 0)
+                end
+            end
+
+            if not fightData.incoming[incomingKey] then
                 local okP, pInfo = pcall(function() return api.Unit:UnitInfo("player") end)
                 if not okP then pInfo = {} end
-                fightData.incoming[sourceName] = {
+                fightData.incoming[incomingKey] = {
+                    displayName = sourceName,
                     skills = {}, startTime = now, lastUpdate = now,
                     physDmg = 0, magicDmg = 0, rangedDmg = 0,
                     physAbsorbed = 0, magicAbsorbed = 0, rangedAbsorbed = 0,
@@ -2318,11 +2530,11 @@ local function OnLiveEvent(self, event, ...)
                     },
                 }
             else
-                fightData.incoming[sourceName].lastUpdate = now
+                fightData.incoming[incomingKey].lastUpdate = now
             end
             if absDmg > 0 then
                 -- Infer damage type for incoming hits using our own defense stats
-                local incSnap = fightData.incoming[sourceName].defSnap
+                local incSnap = fightData.incoming[incomingKey].defSnap
                 local incInferSnap = incSnap and {
                     targetArmorPct = incSnap.armorPct or 0,
                     targetResistPct = incSnap.resistPct or 0,
@@ -2337,7 +2549,6 @@ local function OnLiveEvent(self, event, ...)
 
                 -- Log first occurrence of each incoming skill to file
                 if CONFIG.LOG_UNKNOWN_INCOMING then
-                    -- Load seen skills from file on first use
                     if not incomingSkillLoaded then
                         incomingSkillLoaded = true
                         local ok, existing = pcall(function() return api.File:Read(incomingSkillFile) end)
@@ -2364,35 +2575,92 @@ local function OnLiveEvent(self, event, ...)
                     end
                 end
                 if incIsMagic then
-                    fightData.incoming[sourceName].magicDmg      = (fightData.incoming[sourceName].magicDmg      or 0) + absDmg
-                    fightData.incoming[sourceName].magicAbsorbed = (fightData.incoming[sourceName].magicAbsorbed  or 0) + absorbed
-                    fightData.incoming[sourceName].magicHits     = (fightData.incoming[sourceName].magicHits      or 0) + 1
+                    fightData.incoming[incomingKey].magicDmg      = (fightData.incoming[incomingKey].magicDmg      or 0) + absDmg
+                    fightData.incoming[incomingKey].magicAbsorbed = (fightData.incoming[incomingKey].magicAbsorbed  or 0) + absorbed
+                    fightData.incoming[incomingKey].magicHits     = (fightData.incoming[incomingKey].magicHits      or 0) + 1
                 elseif incIsRanged then
-                    fightData.incoming[sourceName].rangedDmg      = (fightData.incoming[sourceName].rangedDmg      or 0) + absDmg
-                    fightData.incoming[sourceName].rangedAbsorbed = (fightData.incoming[sourceName].rangedAbsorbed or 0) + absorbed
-                    fightData.incoming[sourceName].rangedHits     = (fightData.incoming[sourceName].rangedHits     or 0) + 1
+                    fightData.incoming[incomingKey].rangedDmg      = (fightData.incoming[incomingKey].rangedDmg      or 0) + absDmg
+                    fightData.incoming[incomingKey].rangedAbsorbed = (fightData.incoming[incomingKey].rangedAbsorbed or 0) + absorbed
+                    fightData.incoming[incomingKey].rangedHits     = (fightData.incoming[incomingKey].rangedHits     or 0) + 1
                 else
-                    fightData.incoming[sourceName].physDmg      = (fightData.incoming[sourceName].physDmg      or 0) + absDmg
-                    fightData.incoming[sourceName].physAbsorbed = (fightData.incoming[sourceName].physAbsorbed  or 0) + absorbed
-                    fightData.incoming[sourceName].physHits     = (fightData.incoming[sourceName].physHits      or 0) + 1
+                    fightData.incoming[incomingKey].physDmg      = (fightData.incoming[incomingKey].physDmg      or 0) + absDmg
+                    fightData.incoming[incomingKey].physAbsorbed = (fightData.incoming[incomingKey].physAbsorbed  or 0) + absorbed
+                    fightData.incoming[incomingKey].physHits     = (fightData.incoming[incomingKey].physHits      or 0) + 1
                 end
-                fightData.incoming[sourceName].skills[skill] = (fightData.incoming[sourceName].skills[skill] or 0) + absDmg
-                fightData.incoming[sourceName].totalAbsorbed = (fightData.incoming[sourceName].totalAbsorbed or 0) + absorbed
+                fightData.incoming[incomingKey].skills[skill] = (fightData.incoming[incomingKey].skills[skill] or 0) + absDmg
+                fightData.incoming[incomingKey].totalAbsorbed = (fightData.incoming[incomingKey].totalAbsorbed or 0) + absorbed
+                -- Bulwark Ballad: damage prevented by ballad's defense bonus
+                local bulwarkAnno = ""
+                if bulwarkActive then
+                    local defBonus, baseline = 0, 0
+                    if incIsMagic and bulwarkResistBonus > 0 and baselineMagicResist then
+                        defBonus = bulwarkResistBonus; baseline = baselineMagicResist
+                    elseif bulwarkArmorBonus > 0 and baselineArmor then
+                        defBonus = bulwarkArmorBonus; baseline = baselineArmor
+                    end
+                    if defBonus > 0 and baseline > 0 then
+                        local prevented = math.floor(absDmg * defBonus / (baseline + 8000))
+                        if prevented > 0 then
+                            fightData.incoming[incomingKey].bulwarkPrevented = (fightData.incoming[incomingKey].bulwarkPrevented or 0) + prevented
+                            bulwarkAnno = " [Ballad +" .. prevented .. "]"
+                        end
+                    end
+                end
                 local c = GetSafeColor(CONFIG.COL_INCOMING)
                 local incHitDisplay = string.find(tostring(hitType):upper(), "CRITICAL") and "Critical" or "HIT"
-                local sc = PALETTE.SkyBlue
-                RecordLogForTarget(sourceName, sourceName,
+                local sc = GetSafeColor(CONFIG.COL_SKILL_LABEL)
+                RecordLogForTarget(incomingKey, sourceName,
                     string.format("< %s from %s", skill, sourceName),
                     sc[1], sc[2], sc[3],
                     { logType = "incoming", skill = skill, source = sourceName, target = targetName, damage = absDmg, absorbed = absorbed, hitType = hitType })
-                RecordLogForTarget(sourceName, sourceName,
-                    absorbed > 0
-                        and string.format("[%s] %d (%s|%d absorbed)", incLabel, absDmg, incHitDisplay, absorbed)
-                        or  string.format("[%s] %d (%s)", incLabel, absDmg, incHitDisplay),
-                    c[1], c[2], c[3], nil)
+                local incLine = absorbed > 0
+                    and string.format("[%s] %d (%s|%d absorbed)%s", incLabel, absDmg, incHitDisplay, absorbed, bulwarkAnno)
+                    or  string.format("[%s] %d (%s)%s", incLabel, absDmg, incHitDisplay, bulwarkAnno)
+                local incLineSimple = absorbed > 0
+                    and string.format("[%s] %d (%s|%d absorbed)", incLabel, absDmg, incHitDisplay, absorbed)
+                    or  string.format("[%s] %d (%s)", incLabel, absDmg, incHitDisplay)
+                local incMeta = incLine ~= incLineSimple and { liveText = incLineSimple } or nil
+                RecordLogForTarget(incomingKey, sourceName, incLine, c[1], c[2], c[3], incMeta)
+                -- Incoming mitigation breakdown: reverse the full reduction chain
+                -- Chain: raw → toughness → armor/resist → % reduction → flat reduction = absDmg
+                do
+                    local playerDef  = incIsMagic and currentMagicResist or currentArmor
+                    local incPctMul  = incIsMagic and incDmgStats.spellMul  or (isRangedTag and incDmgStats.rangedMul or incDmgStats.meleeMul)
+                    local incFlatVal = incIsMagic and incDmgStats.spellVal   or (isRangedTag and incDmgStats.rangedVal or incDmgStats.meleeVal)
+                    -- Step 1: reverse flat reduction (flatVal is negative, so add it back)
+                    local flatReduction = math.max(0, -math.floor(incFlatVal))
+                    local postPct = absDmg + flatReduction
+                    -- Step 2: reverse % reduction (pctMul is negative, e.g. -19.4 means ×0.806)
+                    local pctMul = 1 + incPctMul / 100  -- e.g. 1 + (-19.4/100) = 0.806
+                    local postArmor = pctMul < 1 and pctMul > 0 and math.floor(postPct / pctMul) or postPct
+                    local pctReduction = math.max(0, postArmor - postPct)
+                    -- Step 3: reverse armor/resist (enemy pen unknown; PvE exact, PvP approximate)
+                    local postTough = playerDef > 0
+                        and math.floor(postArmor * (playerDef + 8000) / 8000)
+                        or  postArmor
+                    local defReduction = math.max(0, postTough - postArmor)
+                    -- Step 4: reverse toughness — only applies in PvP (source must be a player)
+                    local computedRaw = incSourceToughness > 0
+                        and math.floor(postTough * (incSourceToughness + 8000) / 8000)
+                        or  postTough
+                    local toughReduction = math.max(0, computedRaw - postTough)
+                    if computedRaw > absDmg then
+                        local defLabel = incIsMagic and "Resist" or "Armor"
+                        local mitParts = { string.format("Raw %d", computedRaw) }
+                        if toughReduction > 0 then mitParts[#mitParts+1] = string.format("Tough -%d", toughReduction) end
+                        if defReduction   > 0 then mitParts[#mitParts+1] = string.format("%s -%d", defLabel, defReduction) end
+                        local redLabel   = incIsMagic and "Magic DR"   or (isRangedTag and "Ranged DR"   or "Melee DR")
+                        local fixedLabel = incIsMagic and "Fixed Magic" or (isRangedTag and "Fixed Ranged" or "Fixed Melee")
+                        if pctReduction  > 0 then mitParts[#mitParts+1] = string.format("%s -%d", redLabel,   pctReduction)  end
+                        if flatReduction > 0 then mitParts[#mitParts+1] = string.format("%s -%d", fixedLabel, flatReduction) end
+                        RecordLogForTarget(incomingKey, sourceName,
+                            "  " .. table.concat(mitParts, " | "),
+                            0.6, 0.6, 0.6, { detailOnly = true })
+                    end
+                end
             elseif isCC then
                 local c = GetSafeColor(CONFIG.COL_CC)
-                RecordLogForTarget(sourceName, sourceName, string.format("< %s (CC) from %s", skill, sourceName), c[1], c[2], c[3],
+                RecordLogForTarget(incomingKey, sourceName, string.format("< %s (CC) from %s", skill, sourceName), c[1], c[2], c[3],
                     { logType = "cc", skill = skill, source = sourceName, target = targetName })
             end
         end
@@ -2461,18 +2729,13 @@ local function OnLiveEvent(self, event, ...)
         end
 
     elseif event == "SPELLCAST_STOP" then
-        -- patch 243+: fires when a cast is cancelled or interrupted.
+        -- patch 243+: fires when a cast ends (both success and interrupt).
+        -- Cannot reliably distinguish from SPELLCAST_SUCCEEDED here, so just clear state.
         if CONFIG.DEBUG_LOG_EVENTS then
             LogEventToFile(event, args)
         end
-        local interrupted = currentCast
         currentCast = nil
         lastPlayerCast = nil
-        -- Log the interrupt in the live feed if we were mid-fight
-        if inCombat and interrupted and interrupted ~= "" then
-            local c = GetSafeColor("Orange")
-            LogEntry("!! Cast interrupted: " .. interrupted, c[1], c[2], c[3])
-        end
 
     elseif event == "TARGET_TO_TARGET_CHANGED" then
         -- patch 243+: fires when what your target is targeting changes.
@@ -2649,6 +2912,8 @@ local function OnLiveUpdate(self, dt)
             local nowMs = api.Time:GetUiMsec()
             local wasZeal = zealActive
             zealActive = false
+            chantyActive = false
+            bulwarkActive = false
             local bc = api.Unit:UnitBuffCount("player") or 0
             local newStackCache = {}
             for i = 1, bc do
@@ -2663,6 +2928,10 @@ local function OnLiveUpdate(self, dt)
                         if ok and tt and tt.name then bname = tt.name; buffNameCache[b.buff_id] = bname end
                     end
                     if bname then
+                        -- Chanty check (by name prefix, covers all ranks)
+                        if string.find(string.lower(bname), "bloody chant") then chantyActive = true end
+                        -- Bulwark Ballad check
+                        if string.find(string.lower(bname), "bulwark ballad") then bulwarkActive = true end
                         -- Populate stack cache (used by GetPlayerBuffStacks in combat handler)
                         newStackCache[bname] = math.max(1, tonumber(b.stack or b.count or 1))
                         -- Duel-end check
@@ -2675,6 +2944,41 @@ local function OnLiveUpdate(self, dt)
                 end
             end
             playerBuffStackCache = newStackCache
+
+            -- Update song buff stats from playerInfo
+            rhythmStacks = (playerBuffStackCache and playerBuffStackCache["Rhythm"]) or 0
+            local okP, pInfoScan = pcall(function() return api.Unit:UnitInfo("player") end)
+            if okP and pInfoScan then
+                currentSpellDmgMul  = tonumber(pInfoScan.spell_damage_mul or 0)
+                currentArmor        = tonumber(pInfoScan.armor             or 0)
+                currentMagicResist  = tonumber(pInfoScan.magic_resist      or 0)
+                currentSpellDps     = tonumber(pInfoScan.spell_dps                  or 0)
+                currentBattleResist = tonumber(pInfoScan.battle_resist               or 0)
+                incDmgStats.spellMul  = tonumber(pInfoScan.incoming_spell_damage_mul  or 0)
+                incDmgStats.meleeMul  = tonumber(pInfoScan.incoming_melee_damage_mul  or 0)
+                incDmgStats.rangedMul = tonumber(pInfoScan.incoming_ranged_damage_mul or 0)
+                incDmgStats.spellVal  = tonumber(pInfoScan.incoming_spell_damage_val  or 0)
+                incDmgStats.meleeVal  = tonumber(pInfoScan.incoming_melee_damage_val  or 0)
+                incDmgStats.rangedVal = tonumber(pInfoScan.incoming_ranged_damage_val or 0)
+            end
+            if chantyActive then
+                if baselineSpellDmgMul then
+                    chantySpellBonus = math.max(0, currentSpellDmgMul - baselineSpellDmgMul)
+                end
+            else
+                baselineSpellDmgMul = currentSpellDmgMul
+                chantySpellBonus = 0
+            end
+            if bulwarkActive then
+                if baselineArmor       then bulwarkArmorBonus  = math.max(0, currentArmor       - baselineArmor)       end
+                if baselineMagicResist then bulwarkResistBonus = math.max(0, currentMagicResist - baselineMagicResist) end
+            else
+                baselineArmor        = currentArmor
+                baselineMagicResist  = currentMagicResist
+                bulwarkArmorBonus    = 0
+                bulwarkResistBonus   = 0
+            end
+
             if inCombat then
                 if zealActive and not wasZeal then
                     zealStartTime = nowMs
@@ -2691,10 +2995,49 @@ local function OnLiveUpdate(self, dt)
             local count = api.Unit:UnitBuffCount("player") or 0
             for i = 1, count do
                 local b = api.Unit:UnitBuff("player", i)
-                if b then buffData[i] = b end
+                if b then
+                    -- Resolve buff name via tooltip
+                    local bname = buffDB[b.buff_id] or buffNameCache[b.buff_id]
+                    if not bname then
+                        local ok2, tt = pcall(function() return api.Ability:GetBuffTooltip(b.buff_id) end)
+                        if ok2 and tt and tt.name then bname = tt.name end
+                    end
+                    buffData[i] = { buff_id = b.buff_id, name = bname or "?", stack = b.stack, timeLeft = b.timeLeft }
+                end
+            end
+            -- Also dump playerInfo spell/magic/damage fields
+            local ok, pInfo = pcall(function() return api.Unit:UnitInfo("player") end)
+            if ok and pInfo then
+                local pDump = {}
+                for k, v in pairs(pInfo) do
+                    local ks = tostring(k):lower()
+                    if string.find(ks, "damage") or string.find(ks, "spell") or string.find(ks, "magic")
+                    or string.find(ks, "armor") or string.find(ks, "defense") or string.find(ks, "resist")
+                    or string.find(ks, "toughness") or string.find(ks, "battle") then
+                        pDump[k] = v
+                    end
+                end
+                buffData["_playerSpellStats"] = pDump
             end
             api.File:Write("CombatLogPro/buff_dump.txt", buffData)
-            LogEntry(string.format("[DUMP] %d player buffs written to buff_dump.txt", count), 0, 1, 0)
+            LogEntry(string.format("[DUMP] %d player buffs + spell stats written to buff_dump.txt", count), 0, 1, 0)
+        end
+
+        if CONFIG.DUMP_RHYTHM then
+            local rhythmStacks = playerBuffStackCache and playerBuffStackCache["Rhythm"] or 0
+            if rhythmStacks ~= rhythmDumpLastStacks then
+                rhythmDumpLastStacks = rhythmStacks
+                local ok, pInfo = pcall(function() return api.Unit:UnitInfo("player") end)
+                if ok and pInfo then
+                    local okR, prev = pcall(function() return api.File:Read("CombatLogPro/rhythm_dump.txt") end)
+                    local existing = (okR and type(prev) == "table") and prev or {}
+                    local entry = { rhythm_stacks = rhythmStacks, stats = {} }
+                    for k, v in pairs(pInfo) do entry.stats[tostring(k)] = v end
+                    existing[#existing + 1] = entry
+                    api.File:Write("CombatLogPro/rhythm_dump.txt", existing)
+                    LogEntry(string.format("[DUMP] Rhythm %d stacks captured", rhythmStacks), 0, 1, 1)
+                end
+            end
         end
 
         -- Continuous target buff/debuff scanner
@@ -2862,7 +3205,7 @@ end
 
 local function CreateOptionsWindow()
     wOptions = api.Interface:CreateEmptyWindow("OpWin", "UIParent")
-    wOptions:Show(false); wOptions:SetExtent(380, 560); wOptions:AddAnchor("CENTER", "UIParent", 0, 0); MakeDraggable(wOptions, wOptions)
+    wOptions:Show(false); wOptions:SetExtent(380, 700); wOptions:AddAnchor("CENTER", "UIParent", 0, 0); MakeDraggable(wOptions, wOptions)
     
     CreateBackdrop(wOptions, {0.05, 0.05, 0.05, 0.95})
     
@@ -2881,12 +3224,12 @@ local function CreateOptionsWindow()
     if lblSec1.style then lblSec1.style:SetColor(0.5, 0.8, 1, 1); lblSec1.style:SetAlign(ALIGN.CENTER) end
 
     -- Width Control
-    local btnWDec = wOptions:CreateChildWidget("button", "WDec", 0, true); btnWDec:SetText("-"); btnWDec:SetExtent(30, 24); btnWDec:AddAnchor("TOPLEFT", wOptions, 80, 75)
+    local btnWDec = wOptions:CreateChildWidget("button", "WDec", 0, true); btnWDec:SetText("-"); btnWDec:SetExtent(30, 24); btnWDec:AddAnchor("TOPLEFT", wOptions, 105, 75)
     lblWVal = wOptions:CreateChildWidget("label", "LWV", 0, true); lblWVal:SetText("W: " .. CONFIG.LIVE_WIDTH); lblWVal:SetExtent(100, 24); lblWVal:AddAnchor("LEFT", btnWDec, "RIGHT", 5, 0); if lblWVal.style then lblWVal.style:SetAlign(ALIGN.CENTER) end
     local btnWInc = wOptions:CreateChildWidget("button", "WInc", 0, true); btnWInc:SetText("+"); btnWInc:SetExtent(30, 24); btnWInc:AddAnchor("LEFT", lblWVal, "RIGHT", 5, 0)
-    
+
     -- Height Control
-    local btnHDec = wOptions:CreateChildWidget("button", "HDec", 0, true); btnHDec:SetText("-"); btnHDec:SetExtent(30, 24); btnHDec:AddAnchor("TOPLEFT", wOptions, 80, 105)
+    local btnHDec = wOptions:CreateChildWidget("button", "HDec", 0, true); btnHDec:SetText("-"); btnHDec:SetExtent(30, 24); btnHDec:AddAnchor("TOPLEFT", wOptions, 105, 105)
     lblHVal = wOptions:CreateChildWidget("label", "LHV", 0, true); lblHVal:SetText("H: " .. CONFIG.LIVE_HEIGHT); lblHVal:SetExtent(100, 24); lblHVal:AddAnchor("LEFT", btnHDec, "RIGHT", 5, 0); if lblHVal.style then lblHVal.style:SetAlign(ALIGN.CENTER) end
     local btnHInc = wOptions:CreateChildWidget("button", "HInc", 0, true); btnHInc:SetText("+"); btnHInc:SetExtent(30, 24); btnHInc:AddAnchor("LEFT", lblHVal, "RIGHT", 5, 0)
 
@@ -2935,16 +3278,28 @@ local function CreateOptionsWindow()
         btnSSFilterToggle:SetTextColor(CONFIG.FILTER_STATIC_SHOCK and 0 or 1, CONFIG.FILTER_STATIC_SHOCK and 1 or 0, 0, 1)
     end)
 
+    -- Show Heals Toggle
+    local btnHealToggle = wOptions:CreateChildWidget("button", "HealTog", 0, true)
+    btnHealToggle:SetText(CONFIG.SHOW_HEALS and "Show Heals: ON" or "Show Heals: OFF")
+    btnHealToggle:SetExtent(240, 24); btnHealToggle:AddAnchor("TOP", wOptions, 0, 270)
+    btnHealToggle:SetTextColor(CONFIG.SHOW_HEALS and 0 or 1, CONFIG.SHOW_HEALS and 1 or 0, 0, 1)
+    btnHealToggle:SetHandler("OnClick", function()
+        CONFIG.SHOW_HEALS = not CONFIG.SHOW_HEALS
+        btnHealToggle:SetText(CONFIG.SHOW_HEALS and "Show Heals: ON" or "Show Heals: OFF")
+        btnHealToggle:SetTextColor(CONFIG.SHOW_HEALS and 0 or 1, CONFIG.SHOW_HEALS and 1 or 0, 0, 1)
+        SaveSettings()
+    end)
+
     -- Time Offset Control
-    local btnOffDec = wOptions:CreateChildWidget("button", "OffDec", 0, true); btnOffDec:SetText("-"); btnOffDec:SetExtent(30, 24); btnOffDec:AddAnchor("TOPLEFT", wOptions, 80, 270)
-    lblOffVal = wOptions:CreateChildWidget("label", "OffVal", 0, true); lblOffVal:SetText("Offset: " .. CONFIG.TIME_OFFSET .. "h"); lblOffVal:SetExtent(100, 24); lblOffVal:AddAnchor("LEFT", btnOffDec, "RIGHT", 5, 0); if lblOffVal.style then lblOffVal.style:SetAlign(ALIGN.CENTER) end
+    local btnOffDec = wOptions:CreateChildWidget("button", "OffDec", 0, true); btnOffDec:SetText("-"); btnOffDec:SetExtent(30, 24); btnOffDec:AddAnchor("TOPLEFT", wOptions, 75, 300)
+    lblOffVal = wOptions:CreateChildWidget("label", "OffVal", 0, true); lblOffVal:SetText("Timestamp Offset: " .. CONFIG.TIME_OFFSET .. "h"); lblOffVal:SetExtent(160, 24); lblOffVal:AddAnchor("LEFT", btnOffDec, "RIGHT", 5, 0); if lblOffVal.style then lblOffVal.style:SetAlign(ALIGN.CENTER) end
     local btnOffInc = wOptions:CreateChildWidget("button", "OffInc", 0, true); btnOffInc:SetText("+"); btnOffInc:SetExtent(30, 24); btnOffInc:AddAnchor("LEFT", lblOffVal, "RIGHT", 5, 0)
 
-    btnOffDec:SetHandler("OnClick", function() CONFIG.TIME_OFFSET = CONFIG.TIME_OFFSET - 1; lblOffVal:SetText("Offset: " .. CONFIG.TIME_OFFSET .. "h"); RebuildLiveLabels(); UpdateHistoryDisplay() end)
-    btnOffInc:SetHandler("OnClick", function() CONFIG.TIME_OFFSET = CONFIG.TIME_OFFSET + 1; lblOffVal:SetText("Offset: " .. CONFIG.TIME_OFFSET .. "h"); RebuildLiveLabels(); UpdateHistoryDisplay() end)
+    btnOffDec:SetHandler("OnClick", function() CONFIG.TIME_OFFSET = CONFIG.TIME_OFFSET - 1; lblOffVal:SetText("Timestamp Offset: " .. CONFIG.TIME_OFFSET .. "h"); RebuildLiveLabels(); UpdateHistoryDisplay() end)
+    btnOffInc:SetHandler("OnClick", function() CONFIG.TIME_OFFSET = CONFIG.TIME_OFFSET + 1; lblOffVal:SetText("Timestamp Offset: " .. CONFIG.TIME_OFFSET .. "h"); RebuildLiveLabels(); UpdateHistoryDisplay() end)
 
     -- Scan Frequency Control (ms between each debuff/buff scanner tick)
-    local btnSFDec = wOptions:CreateChildWidget("button", "SFDec", 0, true); btnSFDec:SetText("-"); btnSFDec:SetExtent(30, 24); btnSFDec:AddAnchor("TOPLEFT", wOptions, 80, 300)
+    local btnSFDec = wOptions:CreateChildWidget("button", "SFDec", 0, true); btnSFDec:SetText("-"); btnSFDec:SetExtent(30, 24); btnSFDec:AddAnchor("TOPLEFT", wOptions, 105, 330)
     lblScanFreqVal = wOptions:CreateChildWidget("label", "SFVal", 0, true); lblScanFreqVal:SetText("Scan: " .. CONFIG.SCAN_FREQ .. "ms"); lblScanFreqVal:SetExtent(100, 24); lblScanFreqVal:AddAnchor("LEFT", btnSFDec, "RIGHT", 5, 0); if lblScanFreqVal.style then lblScanFreqVal.style:SetAlign(ALIGN.CENTER) end
     local btnSFInc = wOptions:CreateChildWidget("button", "SFInc", 0, true); btnSFInc:SetText("+"); btnSFInc:SetExtent(30, 24); btnSFInc:AddAnchor("LEFT", lblScanFreqVal, "RIGHT", 5, 0)
 
@@ -2954,31 +3309,104 @@ local function CreateOptionsWindow()
     -- === SECTION 3: COLORS ===
     local lblSec3 = wOptions:CreateChildWidget("label", "Sec3", 0, true)
     lblSec3:SetText("Color Theme")
-    lblSec3:AddAnchor("TOP", wOptions, 0, 340)
+    lblSec3:AddAnchor("TOP", wOptions, 0, 370)
     if lblSec3.style then lblSec3.style:SetColor(0.5, 0.8, 1, 1); lblSec3.style:SetAlign(ALIGN.CENTER) end
 
-    local function CreateColorOption(id, label, configKey, yOffset)
-        local l = wOptions:CreateChildWidget("label", "CL"..id, 0, true); l:SetText(label); l:AddAnchor("TOPLEFT", wOptions, 40, yOffset); l:SetExtent(140, 24)
-        local b = wOptions:CreateChildWidget("button", "CB"..id, 0, true); b:SetText(CONFIG[configKey]); b:SetExtent(120, 24); b:AddAnchor("LEFT", l, "RIGHT", 20, 0)
-        local c = GetSafeColor(CONFIG[configKey]); b:SetTextColor(c[1], c[2], c[3], 1)
-        b:SetHandler("OnClick", function() local nextCol = GetNextColorName(CONFIG[configKey]); CONFIG[configKey] = nextCol; b:SetText(nextCol); local nc = GetSafeColor(nextCol); b:SetTextColor(nc[1], nc[2], nc[3], 1) end)
-        return b
+    local palletWindow = nil
+    local function CreateColorSwatch(id, label, configKey, yOffset)
+        local l = wOptions:CreateChildWidget("label", "CL"..id, 0, true)
+        l:SetText(label); l:SetExtent(140, 24); l:AddAnchor("TOPLEFT", wOptions, 80, yOffset)
+
+        local swatch = wOptions:CreateChildWidget("button", "CS"..id, 0, true)
+        swatch:SetExtent(55, 14); swatch:AddAnchor("LEFT", l, "RIGHT", 20, 5)
+
+        local col = CONFIG[configKey]
+        local bg = swatch:CreateColorDrawable(col[1], col[2], col[3], 1, "background")
+        bg:AddAnchor("TOPLEFT", swatch, 0, 0); bg:AddAnchor("BOTTOMRIGHT", swatch, 0, 0)
+        swatch.colorBG = bg
+        swatch.r, swatch.g, swatch.b = col[1], col[2], col[3]
+
+        swatch:SetHandler("OnClick", function(self)
+            if palletWindow then palletWindow:Show(false); palletWindow = nil end
+            palletWindow = W_ETC.CreatePopupPallet("clpPallet_"..id, "UIParent")
+            palletWindow:SetUILayer("hud")
+            palletWindow:SetCloseOnEscape(true)
+            palletWindow:RemoveAllAnchors()
+            palletWindow:Show(true)
+            palletWindow:AddAnchor("TOPLEFT", self, "TOPRIGHT", 2, 0)
+            palletWindow:SetSelectEventListenWidget(self)
+            palletWindow:EnableHidingIsRemove(true)
+            palletWindow:SetHandler("OnHide", function() palletWindow = nil end)
+        end)
+
+        function swatch:SelectedProcedure(r, g, b, a)
+            self.colorBG:SetColor(r, g, b, 1)
+            self.r, self.g, self.b = r, g, b
+            CONFIG[configKey] = {r, g, b}
+            SaveSettings()
+        end
+
+        return swatch
     end
 
-    CreateColorOption(1, "Outgoing Dmg", "COL_OUT_NRM", 370)
-    CreateColorOption(2, "Critical Hits", "COL_OUT_CRIT", 400)
-    CreateColorOption(3, "Incoming Dmg", "COL_INCOMING", 430)
-    CreateColorOption(4, "Healing", "COL_HEAL", 460)
-    CreateColorOption(5, "CC Effects", "COL_CC", 490)
-    
-    local btnClose = wOptions:CreateChildWidget("button", "Close", 0, true); btnClose:SetText("Done"); btnClose:SetExtent(120, 30); btnClose:AddAnchor("BOTTOM", wOptions, 0, -20)
+    local DEFAULT_COLORS = {
+        COL_OUT_NRM   = {1, 0.5, 0},
+        COL_OUT_CRIT  = {1, 0, 0},
+        COL_INCOMING  = {1, 0.5, 0},
+        COL_HEAL      = {0, 1, 0},
+        COL_CC        = {0.8, 0.3, 1},
+        COL_ZEAL_CRIT = {1, 0.3, 1},
+        COL_SKILL_LABEL = {0, 1, 1},
+    }
+    local sw1 = CreateColorSwatch(1, "Outgoing Dmg",  "COL_OUT_NRM",    400)
+    local sw2 = CreateColorSwatch(2, "Critical Hits", "COL_OUT_CRIT",   430)
+    local sw3 = CreateColorSwatch(3, "Incoming Dmg",  "COL_INCOMING",   460)
+    local sw4 = CreateColorSwatch(4, "Healing",       "COL_HEAL",       490)
+    local sw5 = CreateColorSwatch(5, "CC Effects",    "COL_CC",         520)
+    local sw6 = CreateColorSwatch(6, "Zeal Crit",     "COL_ZEAL_CRIT",  550)
+    local sw7 = CreateColorSwatch(7, "Skill Labels",  "COL_SKILL_LABEL",580)
+
+    local btnClose = wOptions:CreateChildWidget("button", "Close", 0, true)
+    btnClose:SetText("Done"); btnClose:SetExtent(120, 26); btnClose:AddAnchor("BOTTOM", wOptions, 0, -15)
     btnClose:SetHandler("OnClick", function() wOptions:Show(false) end)
+
+    local btnRestore = wOptions:CreateChildWidget("button", "RestoreColors", 0, true)
+    btnRestore:SetText("Restore Default Colors"); btnRestore:SetExtent(200, 26); btnRestore:AddAnchor("BOTTOM", btnClose, "TOP", 0, -10)
+    btnRestore:SetHandler("OnClick", function()
+        local swatches = {
+            { sw1, "COL_OUT_NRM"    },
+            { sw2, "COL_OUT_CRIT"   },
+            { sw3, "COL_INCOMING"   },
+            { sw4, "COL_HEAL"       },
+            { sw5, "COL_CC"         },
+            { sw6, "COL_ZEAL_CRIT"  },
+            { sw7, "COL_SKILL_LABEL"},
+        }
+        for _, entry in ipairs(swatches) do
+            local sw, key = entry[1], entry[2]
+            local d = DEFAULT_COLORS[key]
+            CONFIG[key] = {d[1], d[2], d[3]}
+            sw.colorBG:SetColor(d[1], d[2], d[3], 1)
+            sw.r, sw.g, sw.b = d[1], d[2], d[3]
+        end
+        SaveSettings()
+    end)
 end
 
 local function Load()
     local myId = api.Unit:GetUnitId("player")
     PLAYER_NAME = api.Unit:GetUnitNameById(myId)
     if not PLAYER_NAME or PLAYER_NAME == "" then PLAYER_NAME = "Unknown" end
+    PLAYER_UNIT_ID = tostring(myId or "")
+
+    -- Seed song buff baselines from current player stats so they're never nil,
+    -- even if chanty/ballad was already active when the addon loaded.
+    local okInit, pInit = pcall(function() return api.Unit:UnitInfo("player") end)
+    if okInit and pInit then
+        baselineSpellDmgMul = tonumber(pInit.spell_damage_mul or 0)
+        baselineArmor       = tonumber(pInit.armor             or 0)
+        baselineMagicResist = tonumber(pInit.magic_resist      or 0)
+    end
 
     BASE_SECONDS_OF_DAY = 0
     BASE_APP_MSEC = 0
@@ -3179,6 +3607,7 @@ local function Load()
     wButton:SetHandler("OnEvent", OnLiveEvent)
     wButton:SetHandler("OnUpdate", OnLiveUpdate)
     wButton:RegisterEvent("COMBAT_MSG")
+    wButton:RegisterEvent("COMBAT_TEXT")  -- provides sourceUnitId to distinguish same-named mobs
     wButton:RegisterEvent("UNIT_COMBAT_STATE_CHANGED")
     wButton:RegisterEvent("TARGET_CHANGED")           -- patch 243+: instant target tracking
     wButton:RegisterEvent("TARGET_TO_TARGET_CHANGED") -- patch 243+: live enemy-targeting-player state
