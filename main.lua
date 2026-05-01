@@ -3180,7 +3180,7 @@ local function OnLiveUpdate(self, dt)
                  if tostring(id) ~= tostring(tId) then hasOtherTargets = true; break end
              end
              currentTimeoutLimit = hasOtherTargets and CONFIG.COMBAT_WAIT or 2000
-        elseif tId and activeCCSessions[tId] and next(activeCCSessions[tId]) ~= nil then
+        elseif tId and activeCCSessions[tId] and (function(t) for _ in pairs(t) do return true end return false end)(activeCCSessions[tId]) then
              currentTimeoutLimit = 10000 
              for buffName, startTime in pairs(activeCCSessions[tId]) do
                  if (now - startTime) > 45000 then activeCCSessions[tId][buffName] = nil end
