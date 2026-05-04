@@ -1806,6 +1806,7 @@ local function FinishFight()
 
     -- Healing Received Summary (separate green sessions)
     if CONFIG.SHOW_HEALS then
+    local c = GetSafeColor(CONFIG.COL_HEAL)
     for sourceName, data in pairs(healData.received) do
         local key = "recv_" .. sourceName
         RecordHealLog(key, sourceName, "--- HEALED BY: " .. sourceName .. " ---", c[1], c[2], c[3], { logType = "summary" })
@@ -2625,8 +2626,8 @@ local function OnLiveEvent(self, event, ...)
                 -- Chain: raw → toughness → armor/resist → % reduction → flat reduction = absDmg
                 do
                     local playerDef  = incIsMagic and currentMagicResist or currentArmor
-                    local incPctMul  = incIsMagic and incDmgStats.spellMul  or (isRangedTag and incDmgStats.rangedMul or incDmgStats.meleeMul)
-                    local incFlatVal = incIsMagic and incDmgStats.spellVal   or (isRangedTag and incDmgStats.rangedVal or incDmgStats.meleeVal)
+                    local incPctMul  = incIsMagic and incDmgStats.spellMul  or (incIsRanged and incDmgStats.rangedMul or incDmgStats.meleeMul)
+                    local incFlatVal = incIsMagic and incDmgStats.spellVal   or (incIsRanged and incDmgStats.rangedVal or incDmgStats.meleeVal)
                     -- Step 1: reverse flat reduction (flatVal is negative, so add it back)
                     local flatReduction = math.max(0, -math.floor(incFlatVal))
                     local postPct = absDmg + flatReduction
@@ -2649,8 +2650,8 @@ local function OnLiveEvent(self, event, ...)
                         local mitParts = { string.format("Raw %d", computedRaw) }
                         if toughReduction > 0 then mitParts[#mitParts+1] = string.format("Tough -%d", toughReduction) end
                         if defReduction   > 0 then mitParts[#mitParts+1] = string.format("%s -%d", defLabel, defReduction) end
-                        local redLabel   = incIsMagic and "Magic DR"   or (isRangedTag and "Ranged DR"   or "Melee DR")
-                        local fixedLabel = incIsMagic and "Fixed Magic" or (isRangedTag and "Fixed Ranged" or "Fixed Melee")
+                        local redLabel   = incIsMagic and "Magic DR"   or (incIsRanged and "Ranged DR"   or "Melee DR")
+                        local fixedLabel = incIsMagic and "Fixed Magic" or (incIsRanged and "Fixed Ranged" or "Fixed Melee")
                         if pctReduction  > 0 then mitParts[#mitParts+1] = string.format("%s -%d", redLabel,   pctReduction)  end
                         if flatReduction > 0 then mitParts[#mitParts+1] = string.format("%s -%d", fixedLabel, flatReduction) end
                         RecordLogForTarget(incomingKey, sourceName,
