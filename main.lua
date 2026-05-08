@@ -42,7 +42,7 @@ local addon = {
     name = "CombatLogPro",
     author = "Cydaphex",
     desc = "Combat Log with separated heal tracking and debuff scanner",
-    version = "1.0.1" -- patch 243 API integration
+    version = "1.0.5" -- multi-class skill bonus tracking
 }
 
 -- [[ COMPATIBILITY PATCH ]] --
@@ -370,6 +370,29 @@ local currentBattleResist = 0
 local incDmgStats = { spellMul=0, meleeMul=0, rangedMul=0, spellVal=0, meleeVal=0, rangedVal=0 }
 local rhythmStacks          = 0     -- current Rhythm buff stack count
 local RHYTHM_DPS_PER_STACK  = 7.0  -- confirmed from dump: spell_dps rises exactly +7 per stack
+
+-- Grouped skill-bonus tracking table (1 upvalue instead of many separate locals)
+-- All per-scan state for stacking/active mechanics lives here.
+local bonuses = {
+    -- Magic Circle (Sorcery): boosts spell_dps; contribution isolated from Rhythm via baseline
+    magicCircleActive    = false,
+    magicCircleDpsBonus  = 0,
+    baseSpellDps         = nil,   -- set when neither Rhythm nor Magic Circle is active
+    -- Delirium (Battlerage): +2%/stack melee & ranged dmg
+    deliriumStacks       = 0,
+    -- Burning Brand (Occultism): +2%/stack magic dmg
+    burningBrandStacks   = 0,
+    -- Overpowered Spell Locus (Occultism): fixed +15% all skill dmg
+    overpoweredActive    = false,
+    -- Assassination (Shadowplay): fixed +12% all skill dmg
+    assassinationActive  = false,
+    -- Battle Focus (Battlerage): +20% melee crit dmg (baked into critExtra via stat snapshot)
+    battleFocusActive    = false,
+    -- Intensified Harm (Occultism): +25% all crit dmg (baked into critExtra via stat snapshot)
+    intensifiedHarmActive = false,
+    -- Inspired (Auramancy): +52%/stack bonus to Vicious Implosion
+    inspiredStacks       = 0,
+}
 
 -- ParseCombatMessage availability check (done once at load, not per event)
 local _parseCombatMessage = ParseCombatMessage
@@ -1454,14 +1477,23 @@ local function FinishFight()
         if zealActive and zealStartTime then
             finalZealTime = finalZealTime + (api.Time:GetUiMsec() - zealStartTime)
         end
-        -- Damage breakdown: Base + Crit + Zeal + Chanty = Total
-        local critBonusDmg    = data.critBonusDmg   or 0
-        local chantyBonusDmg2 = data.chantyBonusDmg or 0
-        local zealExtraDmg2   = data.zealExtraDmg   or 0
-        local rhythmBonusDmg  = data.rhythmBonusDmg or 0
+        -- Damage breakdown: Base + Crit + Zeal + Chanty + Rhythm + new mechanics = Total
+        local critBonusDmg       = data.critBonusDmg          or 0
+        local chantyBonusDmg2    = data.chantyBonusDmg        or 0
+        local zealExtraDmg2      = data.zealExtraDmg          or 0
+        local rhythmBonusDmg     = data.rhythmBonusDmg        or 0
+        local mcBonusDmg         = data.magicCircleBonusDmg   or 0
+        local deliriumBonusDmg   = data.deliriumBonusDmg      or 0
+        local bbBonusDmg         = data.burningBrandBonusDmg  or 0
+        local opBonusDmg         = data.overpoweredBonusDmg   or 0
+        local assassinBonusDmg   = data.assassinationBonusDmg or 0
+        local inspiredBonusDmg   = data.inspiredBonusDmg      or 0
         local totalDealt = (data.magicDmg or 0) + (data.physDmg or 0) + (data.rangedDmg or 0)
-        local baseDmg = math.max(0, totalDealt - critBonusDmg - zealExtraDmg2 - chantyBonusDmg2 - rhythmBonusDmg)
-        if (critBonusDmg > 0 or chantyBonusDmg2 > 0 or zealExtraDmg2 > 0 or rhythmBonusDmg > 0) and duration > 0 then
+        local baseDmg = math.max(0, totalDealt - critBonusDmg - zealExtraDmg2 - chantyBonusDmg2 - rhythmBonusDmg
+            - mcBonusDmg - deliriumBonusDmg - bbBonusDmg - opBonusDmg - assassinBonusDmg - inspiredBonusDmg)
+        if (critBonusDmg > 0 or chantyBonusDmg2 > 0 or zealExtraDmg2 > 0 or rhythmBonusDmg > 0
+        or mcBonusDmg > 0 or deliriumBonusDmg > 0 or bbBonusDmg > 0 or opBonusDmg > 0
+        or assassinBonusDmg > 0 or inspiredBonusDmg > 0) and duration > 0 then
             local baseDps = baseDmg / duration
             local baseColor = { 0.75, 0.75, 0.75 }
             RecordLogForTarget(id, tName,
@@ -1509,6 +1541,68 @@ local function FinishFight()
                 string.format("  [R] Rhythm: +%d bonus dmg (+%.0f DPS)",
                     rhythmBonusDmg, rhythmDps),
                 rhythmColor[1], rhythmColor[2], rhythmColor[3], { logType = "summary" })
+        end
+
+        -- Magic Circle summary (Sorcery)
+        if mcBonusDmg > 0 and duration > 0 then
+            RecordLogForTarget(id, tName,
+                string.format("  [MC] Magic Circle: +%d bonus dmg (+%.0f DPS)",
+                    mcBonusDmg, mcBonusDmg / duration),
+                0.4, 0.7, 1, { logType = "summary" })
+        end
+
+        -- Delirium summary (Battlerage)
+        if deliriumBonusDmg > 0 and duration > 0 then
+            RecordLogForTarget(id, tName,
+                string.format("  [D] Delirium: +%d bonus dmg (+%.0f DPS)",
+                    deliriumBonusDmg, deliriumBonusDmg / duration),
+                1, 0.55, 0.2, { logType = "summary" })
+        end
+
+        -- Burning Brand summary (Occultism)
+        if bbBonusDmg > 0 and duration > 0 then
+            RecordLogForTarget(id, tName,
+                string.format("  [BB] Burning Brand: +%d bonus dmg (+%.0f DPS)",
+                    bbBonusDmg, bbBonusDmg / duration),
+                1, 0.35, 0.35, { logType = "summary" })
+        end
+
+        -- Overpowered Spell Locus summary (Occultism)
+        if opBonusDmg > 0 and duration > 0 then
+            RecordLogForTarget(id, tName,
+                string.format("  [OS] Op. Spell Locus: +%d bonus dmg (+%.0f DPS)",
+                    opBonusDmg, opBonusDmg / duration),
+                0.85, 0.55, 1, { logType = "summary" })
+        end
+
+        -- Assassination summary (Shadowplay)
+        if assassinBonusDmg > 0 and duration > 0 then
+            RecordLogForTarget(id, tName,
+                string.format("  [AS] Assassination: +%d bonus dmg (+%.0f DPS)",
+                    assassinBonusDmg, assassinBonusDmg / duration),
+                0.8, 0.8, 0.25, { logType = "summary" })
+        end
+
+        -- Inspired summary (Auramancy — Vicious Implosion only)
+        if inspiredBonusDmg > 0 and duration > 0 then
+            RecordLogForTarget(id, tName,
+                string.format("  [IN] Inspired: +%d bonus dmg (+%.0f DPS)",
+                    inspiredBonusDmg, inspiredBonusDmg / duration),
+                0.65, 0.95, 0.65, { logType = "summary" })
+        end
+
+        -- Battle Focus note: boosts melee_critical_bonus stat (captured in critExtra via snapshot)
+        if data.battleFocusWasActive then
+            RecordLogForTarget(id, tName,
+                "  [BF] Battle Focus: active (+20% melee crit dmg, included in crit total)",
+                0.95, 0.55, 0.2, { logType = "summary" })
+        end
+
+        -- Intensified Harm note: boosts all crit via stat (captured in critExtra via snapshot)
+        if data.intensifiedHarmWasActive then
+            RecordLogForTarget(id, tName,
+                "  [IH] Intensified Harm: active (+25% all crit dmg, included in crit total)",
+                1, 0.3, 0.55, { logType = "summary" })
         end
 
         -- Combo summary
@@ -2289,12 +2383,50 @@ local function OnLiveEvent(self, event, ...)
                 local skillLine = string.format("%s: %s%s", skill, targetName, bsTag)
                 -- Compute per-hit bonuses (accumulated into outData, logged as separate colored lines)
                 local zealBonus, chantyBonus, critExtra, rhythmBonus = 0, 0, 0, 0
+                local mcBonus, deliriumBonus, bbBonus, opBonus, assassinBonus, inspiredBonus = 0, 0, 0, 0, 0, 0
                 -- Rhythm: additive to spell_dps, computed from current stacks and spell_dps stat
                 if rhythmStacks > 0 and isMagicHit and currentSpellDps > 0 then
                     local rhythmDpsBonus = rhythmStacks * RHYTHM_DPS_PER_STACK
                     rhythmBonus = math.floor(absDmg * rhythmDpsBonus / currentSpellDps)
                     outData.rhythmBonusDmg = (outData.rhythmBonusDmg or 0) + rhythmBonus
                 end
+                -- Magic Circle: spell_dps boost isolated from Rhythm via baseline delta
+                if bonuses.magicCircleActive and bonuses.magicCircleDpsBonus > 0 and isMagicHit and currentSpellDps > 0 then
+                    mcBonus = math.floor(absDmg * bonuses.magicCircleDpsBonus / currentSpellDps)
+                    outData.magicCircleBonusDmg = (outData.magicCircleBonusDmg or 0) + mcBonus
+                end
+                -- Delirium: +2%/stack for melee and ranged hits
+                if bonuses.deliriumStacks > 0 and not isMagicHit then
+                    local pct = bonuses.deliriumStacks * 2
+                    deliriumBonus = math.floor(absDmg * pct / (100 + pct))
+                    outData.deliriumBonusDmg = (outData.deliriumBonusDmg or 0) + deliriumBonus
+                end
+                -- Burning Brand: +2%/stack for magic hits
+                if bonuses.burningBrandStacks > 0 and isMagicHit then
+                    local pct = bonuses.burningBrandStacks * 2
+                    bbBonus = math.floor(absDmg * pct / (100 + pct))
+                    outData.burningBrandBonusDmg = (outData.burningBrandBonusDmg or 0) + bbBonus
+                end
+                -- Overpowered Spell Locus: fixed +15% all skill damage
+                if bonuses.overpoweredActive then
+                    opBonus = math.floor(absDmg * 15 / 115)
+                    outData.overpoweredBonusDmg = (outData.overpoweredBonusDmg or 0) + opBonus
+                end
+                -- Assassination: fixed +12% all skill damage
+                if bonuses.assassinationActive then
+                    assassinBonus = math.floor(absDmg * 12 / 112)
+                    outData.assassinationBonusDmg = (outData.assassinationBonusDmg or 0) + assassinBonus
+                end
+                -- Inspired: +52%/stack bonus to Vicious Implosion only
+                if bonuses.inspiredStacks > 0 and skill == "Vicious Implosion" then
+                    local pct = bonuses.inspiredStacks * 52
+                    inspiredBonus = math.floor(absDmg * pct / (100 + pct))
+                    outData.inspiredBonusDmg = (outData.inspiredBonusDmg or 0) + inspiredBonus
+                end
+                -- Battle Focus / Intensified Harm: boost crit stat (already in critExtra via snapshot)
+                -- Track as flags so summary can note they were active during this fight.
+                if bonuses.battleFocusActive    then outData.battleFocusWasActive    = true end
+                if bonuses.intensifiedHarmActive then outData.intensifiedHarmWasActive = true end
                 -- Chanty is computed first — it's the outermost multiplier and is independent of crit.
                 -- Crit must then be computed from the pre-chanty damage to avoid double-counting.
                 if chantyActive and chantySpellBonus > 0 and isMagicHit then
@@ -2325,8 +2457,9 @@ local function OnLiveEvent(self, event, ...)
                 if zealActive then
                     outData.zealHits = (outData.zealHits or 0) + 1
                 end
-                -- Base damage = total minus all bonuses
-                local baseDmg = absDmg - critExtra - zealBonus - chantyBonus - rhythmBonus
+                -- Base damage = total minus all tracked bonuses (clamped to 0)
+                local baseDmg = math.max(0, absDmg - critExtra - zealBonus - chantyBonus - rhythmBonus
+                    - mcBonus - deliriumBonus - bbBonus - opBonus - assassinBonus - inspiredBonus)
                 local dmgLine = absorbed > 0
                     and string.format("[%s] %d (%s|%d absorbed)", dmgLabel, absDmg, hitDisplay, absorbed)
                     or  string.format("[%s] %d (%s)", dmgLabel, absDmg, hitDisplay)
@@ -2410,12 +2543,20 @@ local function OnLiveEvent(self, event, ...)
                 RecordLogForTarget(unitID, targetName, skillLine, sc[1], sc[2], sc[3],
                     { logType = "outgoing", skill = skill, source = sourceName, target = targetName, damage = absDmg, absorbed = absorbed, hitType = hitType })
                 RecordLogForTarget(unitID, targetName, dmgLine, c[1], c[2], c[3], nil)
-                if critExtra > 0 or zealBonus > 0 or chantyBonus > 0 or rhythmBonus > 0 then
+                if critExtra > 0 or zealBonus > 0 or chantyBonus > 0 or rhythmBonus > 0
+                or mcBonus > 0 or deliriumBonus > 0 or bbBonus > 0 or opBonus > 0
+                or assassinBonus > 0 or inspiredBonus > 0 then
                     local parts = { string.format("Base %d", baseDmg) }
-                    if critExtra   > 0 then parts[#parts+1] = string.format("Crit +%d",   critExtra)   end
-                    if zealBonus   > 0 then parts[#parts+1] = string.format("Zeal +%d",   zealBonus)   end
-                    if chantyBonus > 0 then parts[#parts+1] = string.format("Chanty +%d", chantyBonus) end
-                    if rhythmBonus > 0 then parts[#parts+1] = string.format("Rhythm +%d", rhythmBonus) end
+                    if critExtra    > 0 then parts[#parts+1] = string.format("Crit +%d",    critExtra)    end
+                    if zealBonus    > 0 then parts[#parts+1] = string.format("Zeal +%d",    zealBonus)    end
+                    if chantyBonus  > 0 then parts[#parts+1] = string.format("Chanty +%d",  chantyBonus)  end
+                    if rhythmBonus  > 0 then parts[#parts+1] = string.format("Rhythm +%d",  rhythmBonus)  end
+                    if mcBonus      > 0 then parts[#parts+1] = string.format("M.Circle +%d", mcBonus)      end
+                    if deliriumBonus> 0 then parts[#parts+1] = string.format("Delirium +%d", deliriumBonus) end
+                    if bbBonus      > 0 then parts[#parts+1] = string.format("B.Brand +%d",  bbBonus)      end
+                    if opBonus      > 0 then parts[#parts+1] = string.format("Op.Locus +%d", opBonus)      end
+                    if assassinBonus> 0 then parts[#parts+1] = string.format("Assassin +%d", assassinBonus) end
+                    if inspiredBonus> 0 then parts[#parts+1] = string.format("Inspired +%d", inspiredBonus) end
                     RecordLogForTarget(unitID, targetName, "  " .. table.concat(parts, " | "),
                         0.75, 0.75, 0.75, { detailOnly = true })
                 end
@@ -2915,13 +3056,44 @@ local function OnLiveUpdate(self, dt)
             zealActive = false
             chantyActive = false
             bulwarkActive = false
+            bonuses.magicCircleActive    = false
+            bonuses.deliriumStacks       = 0
+            bonuses.burningBrandStacks   = 0
+            bonuses.overpoweredActive    = false
+            bonuses.assassinationActive  = false
+            bonuses.battleFocusActive    = false
+            bonuses.intensifiedHarmActive = false
+            bonuses.inspiredStacks       = 0
             local bc = api.Unit:UnitBuffCount("player") or 0
             local newStackCache = {}
             for i = 1, bc do
                 local b = api.Unit:UnitBuff("player", i)
                 if b and b.buff_id then
-                    -- Zeal check (by known ID)
-                    if b.buff_id == 495 then zealActive = true end
+                    local bid = b.buff_id
+                    local bstacks = math.max(1, tonumber(b.stack or b.count or 1))
+                    -- Zeal check (IDs 494 and 495 both exist in static data)
+                    if bid == 494 or bid == 495 then zealActive = true end
+                    -- Magic Circle (Sorcery): Ranks 1-3 and 5-6 (no Rank 4 in static data)
+                    if bid == 1248 or bid == 1249 or bid == 8075
+                    or bid == 13775 or bid == 13776 then
+                        bonuses.magicCircleActive = true
+                    end
+                    -- Delirium (Battlerage): stacking melee/ranged dmg
+                    if bid == 11344 then bonuses.deliriumStacks = bstacks end
+                    -- Burning Brand (Occultism): stacking magic dmg
+                    if bid == 15002 then bonuses.burningBrandStacks = bstacks end
+                    -- Overpowered Spell Locus (Occultism): fixed +15% all skill dmg
+                    if bid == 2969 or bid == 2970 then bonuses.overpoweredActive = true end
+                    -- Assassination (Shadowplay): fixed +12% all skill dmg
+                    if bid == 18346 then bonuses.assassinationActive = true end
+                    -- Battle Focus (Battlerage): +20% melee crit dmg
+                    if bid == 404 or bid == 5134 or bid == 7651 or bid == 13612 or bid == 13613 then
+                        bonuses.battleFocusActive = true
+                    end
+                    -- Intensified Harm (Occultism): +25% all crit dmg after receiving crit
+                    if bid == 971 or bid == 7559 then bonuses.intensifiedHarmActive = true end
+                    -- Inspired (Auramancy): +52%/stack to Vicious Implosion
+                    if bid == 127 then bonuses.inspiredStacks = bstacks end
                     -- Name resolution (needed for duel-end check and stack cache)
                     local bname = buffDB[b.buff_id] or buffNameCache[b.buff_id]
                     if not bname then
@@ -2955,6 +3127,16 @@ local function OnLiveUpdate(self, dt)
                 currentMagicResist  = tonumber(pInfoScan.magic_resist      or 0)
                 currentSpellDps     = tonumber(pInfoScan.spell_dps                  or 0)
                 currentBattleResist = tonumber(pInfoScan.battle_resist               or 0)
+                -- Magic Circle baseline: capture spell_dps when no Rhythm and no Magic Circle active
+                if not bonuses.magicCircleActive and rhythmStacks == 0 then
+                    bonuses.baseSpellDps = currentSpellDps
+                end
+                if bonuses.magicCircleActive and bonuses.baseSpellDps then
+                    bonuses.magicCircleDpsBonus = math.max(0,
+                        currentSpellDps - bonuses.baseSpellDps - rhythmStacks * RHYTHM_DPS_PER_STACK)
+                else
+                    bonuses.magicCircleDpsBonus = 0
+                end
                 incDmgStats.spellMul  = tonumber(pInfoScan.incoming_spell_damage_mul  or 0)
                 incDmgStats.meleeMul  = tonumber(pInfoScan.incoming_melee_damage_mul  or 0)
                 incDmgStats.rangedMul = tonumber(pInfoScan.incoming_ranged_damage_mul or 0)
