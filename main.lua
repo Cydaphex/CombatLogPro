@@ -2,6 +2,7 @@ local api = require("api")
 
 -- [[ LOAD STATIC DATA ]] --
 local buffDB = {}
+local buffNameToId = {}  -- reverse of buffDB (name -> id) for safe GetBuffTooltip icon lookup
 local dbLoaded, staticData = pcall(require, "/CombatLogPro/static_buff_list")
 if dbLoaded and staticData then
     local allBuffs = staticData.ALL_BUFFS or staticData
@@ -38,11 +39,37 @@ else
     api.Log:Info("[CLP] WARNING: skill_combos.lua failed to load.")
 end
 
+local roleDataLoaded, ROLE_DATA = pcall(require, "/CombatLogPro/role_data")
+if roleDataLoaded and ROLE_DATA then
+    api.Log:Info("[CLP] Role data loaded.")
+else
+    ROLE_DATA = { GetRoleFromClass = function() return nil end, GetRoleFromClassTable = function() return nil end }
+    api.Log:Info("[CLP] WARNING: role_data.lua failed to load.")
+end
+
+local skillIconsLoaded, SKILL_ICONS = pcall(require, "/CombatLogPro/skill_icons")
+if skillIconsLoaded and type(SKILL_ICONS) == "table" then
+    api.Log:Info("[CLP] Skill icons loaded.")
+else
+    SKILL_ICONS = {}
+    api.Log:Info("[CLP] WARNING: skill_icons.lua failed to load.")
+end
+
+-- Ancestral-variant signatures (same-named skills with distinct icons -> detect the equipped
+-- variant from combat behaviour and stamp its icon). See skill_variants.lua for the model.
+local skillVariantsLoaded, SKILL_VARIANTS = pcall(require, "/CombatLogPro/skill_variants")
+if skillVariantsLoaded and type(SKILL_VARIANTS) == "table" then
+    api.Log:Info("[CLP] Skill variants loaded.")
+else
+    SKILL_VARIANTS = {}
+    api.Log:Info("[CLP] WARNING: skill_variants.lua failed to load.")
+end
+
 local addon = {
     name = "CombatLogPro",
     author = "Cydaphex",
     desc = "Combat Log with separated heal tracking and debuff scanner",
-    version = "1.0.5" -- multi-class skill bonus tracking
+    version = "2.0.0" -- 2.0 public release (== tested 1.0.214). Huge jump from public v1.0.5: history/archive redesign, Raid Meter, fight browser (PvE/PvP/Duel + filters + search), same-named-enemy drill-down, ancestral-variant icons, faction-relative name colours, overheal, scrollbars, environmental damage. Mitigation breakdown + untargeted HP% disabled by the 2026-06-18 game API lockdown.
 }
 
 -- [[ COMPATIBILITY PATCH ]] --
@@ -126,6 +153,13 @@ local IGNORE_BUFFS_RAW = {
     "Flight Speed Boost Cooldown", "Twilight Stealth Cooldown",
     "Wind Winner Disabled", "All Spooked Out",
     "Rough Sea Winds", "Unable to Shear",
+    -- Tester-reported log spam (status flags + mana-restore proc trinkets)
+    "Wanted", "Heroic Grandeur", "Calleil's Memory",
+    -- Fishing minigame: the action "skills" log as Magic damage vs the hooked fish,
+    -- which spawns a fake fight (Pink Pufferfish etc). Filtered here so fishing never
+    -- creates a combat log. Re-enable via the Filter Manager's "Show Defaults" if wanted.
+    "Stand Firm Left", "Stand Firm Right", "Give Slack", "Reel In", "Big Reel In",
+    "Strength Contest", "Suspended",
 }
 local IGNORE_LOOKUP = {}
 for _, name in ipairs(IGNORE_BUFFS_RAW) do
@@ -144,6 +178,8 @@ local IGNORE_PATTERNS = {
     "cloth set", "leather set", "plate set",
     -- God/faction energy buffs (Kyprosa's Energy, Eanna's Incarnation, etc.)
     "'s energy", "'s incarnation",
+    -- Mana-restore proc trinkets (Calleil's Memory, Anthalon's Memory, etc.)
+    "'s memory",
     -- Zone/territory blessings
     "hero's blessing", "work permit",
     -- Equip passives
@@ -165,13 +201,45 @@ local IGNORE_PATTERNS = {
     "minor healing potion", "minor mana potion",
 }
 
+-- Player-extensible filter: anyone can add their own buff/skill names in
+-- user_filters.lua (no editing of main.lua) -- merged into the lookups above.
+-- Accepts either a plain array of names, or { names = {...}, patterns = {...} }.
+-- Wrapped in a do-block so its locals free their slots immediately (the main chunk
+-- runs near Lua 5.1's 200-active-locals limit, so we don't leave these lingering).
+do
+    local userFiltersLoaded, USER_FILTERS = pcall(require, "/CombatLogPro/user_filters")
+    if userFiltersLoaded and type(USER_FILTERS) == "table" then
+        local names = USER_FILTERS.names or USER_FILTERS
+        if type(names) == "table" then
+            for _, name in ipairs(names) do
+                if type(name) == "string" and name ~= "" then
+                    IGNORE_LOOKUP[string.lower(name)] = true
+                end
+            end
+        end
+        if type(USER_FILTERS.patterns) == "table" then
+            for _, pat in ipairs(USER_FILTERS.patterns) do
+                if type(pat) == "string" and pat ~= "" then
+                    IGNORE_PATTERNS[#IGNORE_PATTERNS + 1] = string.lower(pat)
+                end
+            end
+        end
+    end
+end
+
 local isIgnoredCache = {}
 local function IsIgnoredBuff(name)
     local cached = isIgnoredCache[name]
     if cached ~= nil then return cached end
     local lower = string.lower(name)
     local result = false
-    if IGNORE_LOOKUP[lower] then
+    -- IGNORE_LOOKUP is tri-state: true = filtered (built-in or custom), false = a default
+    -- the player explicitly DISABLED in the Filter Manager (force-allow, overrides patterns
+    -- too), nil = not a known name (fall through to keyword patterns).
+    local v = IGNORE_LOOKUP[lower]
+    if v == false then
+        result = false
+    elseif v then
         result = true
     else
         for _, pat in ipairs(IGNORE_PATTERNS) do
@@ -189,10 +257,12 @@ local CONFIG = {
     HIST_HEIGHT = 500,
     SIDEBAR_WIDTH = 230,
     BUTTON_WIDTH = 180,
-    VISIBLE_ROWS_HIST = 22,
+    VISIBLE_ROWS_HIST = 16, -- 16 rows fit below the header(30) + toggle bar(28) in a 500px window
     VISIBLE_ROWS_LIVE = 24,
     SESSIONS_VISIBLE = 12,
     LINE_HEIGHT = 18,
+    HIST_ROW_H = 26,
+    RECAP_ICON_X = 185,  -- x of the inline icon on recap rows: "[time] Source —> [icon] Skill ±N" (wide enough for full names)
     COMBAT_WAIT = 4000,
     DOT_WAIT = 3000,
     COL_OUT_NRM    = {1, 0.5, 0},     -- Orange
@@ -210,15 +280,29 @@ local CONFIG = {
     DEBUG_EVENTS    = false, -- set true once to discover chat debuff event name
     DEBUG_HITTYPE   = false, -- set true to log raw args for negated hit events (DODGE/BLOCK/MISS/PARRY)
     DUMP_BUFFS      = false, -- set true once to dump all player buffs to file (activate while chanty is up)
-    DEBUG_PARSE     = false, -- set true to dump all ParseCombatMessage fields to file
-    SCAN_TARGET_BUFFS = false, -- set true to continuously log target buffs/debuffs to file (no duplicates)
-    SCAN_PLAYER_BUFFS = false, -- set true to continuously log buffs/debuffs applied to player (no duplicates)
+    RAID_METER      = true,  -- per-fight Raid Meter: a leaderboard of your RAID's dmg/heal in the history fight-detail. ALWAYS ON (no toggle). Needs the client's "Damage/Heal Info: Target = Raid" or higher to include teammates.
     LOG_UNKNOWN_INCOMING = false, -- log first occurrence of each incoming ability to incoming_abilities.txt; notify in live log if unclassified
-    SHOW_HEALS          = true, -- show healing events in log (both live and history)
-    FILTER_STATIC_SHOCK = true, -- hide sessions where the only damage is passive procs (Electric Shock, etc.)
-    DEBUG_LOG_EVENTS    = false, -- set true to dump all event params to CombatLogPro/event_log.txt
+    SHOW_HEALS          = true, -- ALWAYS ON (no toggle): heals always logged. Hide them per-fight via the history window's TYPE: Healing filter. (Gates kept for safety; flag never flips now.)
+    SHOW_ICONS          = true, -- show skill icons in the live feed (and history rows)
+    MIT_BREAKDOWN       = false, -- outgoing per-type Mitigation & pen breakdown (def/resist/toughness/avoidance/pen/hit/modifiers). API-DEAD since 2026-06-18 (needs enemy UnitInfo/UnitModifierInfo, blocked) -> OFF. Flip true if Aguru re-allows enemy stats for the "target" token. Code preserved, gated.
+    LIVE_OPEN           = true, -- remember if the live window was open/closed last session; restored on login
+    -- Fight-view three-axis filter (WHO x WHAT x DIR). Default all on. A line shows when its WHAT
+    -- is on AND (source side: sw + Dealt) OR (target side: tw + Taken) is enabled.
+    F_WHO_ME            = true,
+    F_WHO_ALLY          = true,
+    F_WHO_ENEMY         = true,
+    F_WHO_MOB           = true,
+    F_WHAT_DMG          = true,
+    F_WHAT_HEAL         = true,
+    F_DIR_DEALT         = true,
+    F_DIR_TAKEN         = true,
     DEBUG_ZERO_HITS     = false, -- set true to dump target buff names on unexplained 0-damage hits (find mount/glider buff names)
     DUMP_RHYTHM         = false, -- auto-captures UnitInfo stats at each new Rhythm stack count; set false when done
+    LOG_ALLY_RECAP      = true,  -- master gate for recording OTHER units' combat (per-class via REC_ALLY/ENEMY/MOB)
+    REC_ALLY            = true,  -- capture toggle: record allies' combat (floodgates)
+    REC_ENEMY           = true,  -- capture toggle: record enemy players' combat
+    REC_MOB             = true,  -- capture toggle: record mobs' combat
+    SPECTATE            = true,  -- ALWAYS ON (no toggle): sessions bracket off OTHERS' combat even when you don't participate (raid-logging). Only has data when the feed carries others' combat -- Damage/Heal Info: Target = Raid+ (Game Settings > Game Info).
 }
 
 local PALETTE = {
@@ -228,29 +312,31 @@ local PALETTE = {
     WarmRed = {1, 0.65, 0, 1},      -- normal outgoing hit (neon amber-orange)
     SkyBlue = {0, 1, 1, 1},           -- skill/ability name lines (pure cyan/neon)
 }
-local PALETTE_KEYS = {"Yellow", "Red", "Green", "Cyan", "Blue", "White", "Orange", "Purple"}
 
-local COL_HEADER  = {0.1, 0.1, 0.1, 1.0} 
-local COL_SIDEBAR = {0.15, 0.15, 0.15, 0.95} 
-local COL_BODY    = {0, 0, 0, 0.7} 
-local COL_LOG_BG  = {0, 0, 0, 1.0} 
-local COL_BTN_RED = {0.6, 0.2, 0.2, 1.0}
+-- Layered grayscale: header lightest (top bar), sidebar mid, body/log soft near-black.
+-- Intentional stepped shades give depth without leaving the black/gray theme.
+local COL_HEADER  = {0.14, 0.14, 0.14, 1.0}
+local COL_SIDEBAR = {0.10, 0.10, 0.10, 0.97}
+local COL_BODY    = {0.05, 0.05, 0.05, 0.92}
+local COL_LOG_BG  = {0.05, 0.05, 0.05, 1.0}
+local COL_BTN_RED = {0.55, 0.20, 0.20, 1.0}
 
 -- ============================================================================
 --  VARIABLES & STATE
 -- ============================================================================
 
 local wLive, wHistory, wOptions, wButton
-local liveLabels, historyLabels = {}, {}
+local liveLabels, historyLabels, liveIcons = {}, {}, {}
+local historyIcons = {}  -- parallel icon pool for the ARCHIVE rich-row render
 local sessionButtons = {}
-local lblSessionCount, liveTitleLabel, liveBodyWidget 
+local lblSessionCount, liveTitleLabel, liveBodyWidget
 local isMinimized = false
-
-local lblWVal, lblHVal, lblOffVal, lblScanFreqVal, btnScanToggle, btnTimeToggle
 
 local liveBuffer, displayBuffer, masterBuffer, allSessions = {}, {}, {}, {}
 local currentSessionLogs, sessionByTarget = {}, {}
 local logScrollOffset, sessionScrollOffset = 0, 0
+local scrollTrack, scrollThumb  -- history-log scrollbar (track + draggable thumb)
+local sessTrack, sessThumb      -- session-list (sidebar) scrollbar
 local viewingMode = "LIVE"
 local liveLayoutDirty = true  -- set true when window dimensions change; RebuildLiveLabels skips layout when false
 
@@ -273,7 +359,7 @@ local playerBuffStackCache = {} -- buffName -> stack count, refreshed each scann
 
 -- Buff names (exact, case-insensitive) that grant invincibility from mount/glider abilities.
 -- Tooltip text matching often misses these since their descriptions vary.
--- Add more here after inspecting buffs in-game with SCAN_TARGET_BUFFS = true.
+-- Add more here after inspecting buffs in-game.
 local KNOWN_INVINCIBLE_BUFF_NAMES = {
     ["dash"]              = true,  -- mount Dash ability (most mounts)
     ["gliding"]           = true,  -- glider deployment / glider flight state
@@ -290,17 +376,11 @@ local DUEL_END_BUFF_NAMES = {
 }
 local lastTargetID = nil
 local scannerTimer = 0
+-- Ally Damage Recap state
+local recapData = {}        -- allyName -> { name = allyName, logs = { {text,r,g,b,time,hpPct,dead}, ... } }
+local allyRoster = {}       -- lowercased member name -> team tag ("team1".."team50")
+local allyRosterTimer = 0   -- ms accumulator for periodic roster rebuilds
 local lastTargetBuffCount = -1  -- used to skip re-scan when buff count unchanged
-
--- Buff scanner state (SCAN_TARGET_BUFFS)
-local seenBuffIds = {}
-local buffScanLoaded = false
-local buffScanFile = "CombatLogPro/target_buffs.txt"
-
--- Player buff/debuff scanner state (SCAN_PLAYER_BUFFS)
-local seenPlayerBuffIds = {}
-local playerBuffScanLoaded = false
-local playerBuffScanFile = "CombatLogPro/player_buffs.txt"
 
 -- Incoming ability logger state (LOG_UNKNOWN_INCOMING)
 local seenIncomingSkills = {}
@@ -310,26 +390,6 @@ local incomingSkillFile = "CombatLogPro/incoming_abilities.txt"
 -- Last cast skill from SPELLCAST_SUCCEEDED (patch 243+) for pre-classification
 local lastPlayerCast = nil
 
--- Event debug log (written to file when DEBUG_LOG_EVENTS = true)
-local eventLogFile = "CombatLogPro/event_log.txt"
-local eventLogLines = {}
-local function LogEventToFile(event, args)
-    local parts = { tostring(api.Time:GetUiMsec()) .. " " .. tostring(event) }
-    for i, v in ipairs(args) do
-        table.insert(parts, "  [" .. i .. "] " .. tostring(v))
-    end
-    table.insert(eventLogLines, table.concat(parts, "\n"))
-    -- Write periodically (don't call File:Write every single event)
-    if #eventLogLines >= 10 then
-        local existing = api.File:Read(eventLogFile) or {}
-        if type(existing) ~= "table" then existing = {} end
-        for _, line in ipairs(eventLogLines) do
-            table.insert(existing, line)
-        end
-        pcall(function() api.File:Write(eventLogFile, existing) end)
-        eventLogLines = {}
-    end
-end
 -- Skill currently being cast (set on SPELLCAST_START, cleared on SPELLCAST_SUCCEEDED/STOP)
 local currentCast = nil
 -- Whether the target is currently targeting the player (updated by TARGET_TO_TARGET_CHANGED)
@@ -409,47 +469,88 @@ local frameNow = 0                     -- api.Time:GetUiMsec() cached per frame
 local SETTINGS_FILE = "CombatLogPro/settings.txt"
 local savedSettings = {}
 
+-- Single source of truth for persisted CONFIG options: saveKey -> CONFIG field.
+-- Both LoadSavedSettings and SaveSettings iterate this list, so an option can
+-- never again be saved-but-not-loaded (or vice versa) due to the two lists drifting.
+-- Window positions are handled separately (they read from widgets, not CONFIG).
+local SETTINGS_SCHEMA = {
+    { key = "liveW",             field = "LIVE_WIDTH"          },
+    { key = "liveH",             field = "LIVE_HEIGHT"         },
+    { key = "scanFreq",          field = "SCAN_FREQ"           },
+    { key = "showIcons",         field = "SHOW_ICONS"          },
+    { key = "liveOpen",          field = "LIVE_OPEN"           },
+    { key = "enableScanner",     field = "ENABLE_SCANNER"      },
+    { key = "showTimestamp",     field = "SHOW_TIMESTAMP"      },
+    { key = "timeOffset",        field = "TIME_OFFSET"         },
+    { key = "logAllyRecap",      field = "LOG_ALLY_RECAP"      },
+    { key = "recAlly",           field = "REC_ALLY"            },
+    { key = "recEnemy",          field = "REC_ENEMY"           },
+    { key = "recMob",            field = "REC_MOB"             },
+    { key = "fWhoMe",            field = "F_WHO_ME"            },
+    { key = "fWhoAlly",          field = "F_WHO_ALLY"          },
+    { key = "fWhoEnemy",         field = "F_WHO_ENEMY"         },
+    { key = "fWhoMob",           field = "F_WHO_MOB"           },
+    { key = "fWhatDmg",          field = "F_WHAT_DMG"          },
+    { key = "fWhatHeal",         field = "F_WHAT_HEAL"         },
+    { key = "fDirDealt",         field = "F_DIR_DEALT"         },
+    { key = "fDirTaken",         field = "F_DIR_TAKEN"         },
+    { key = "colOutNrm",         field = "COL_OUT_NRM"         },
+    { key = "colOutCrit",        field = "COL_OUT_CRIT"        },
+    { key = "colInc",            field = "COL_INCOMING"        },
+    { key = "colHeal",           field = "COL_HEAL"            },
+    { key = "colCC",             field = "COL_CC"              },
+    { key = "colZealCrit",       field = "COL_ZEAL_CRIT"       },
+    { key = "colSkillLbl",       field = "COL_SKILL_LABEL"     },
+}
+
 local function LoadSavedSettings()
+    -- Stored on CONFIG (not a new file-scope local) to respect Lua's 200-locals limit.
+    CONFIG._customFilters = {}
     local data = api.File:Read(SETTINGS_FILE)
     if data and type(data) == "table" then
         savedSettings = data
-        if data.liveW     then CONFIG.LIVE_WIDTH  = data.liveW    end
-        if data.liveH     then CONFIG.LIVE_HEIGHT = data.liveH    end
-        if data.scanFreq  then CONFIG.SCAN_FREQ   = data.scanFreq end
-        if data.showHeals ~= nil then CONFIG.SHOW_HEALS = data.showHeals end
-        if data.colOutNrm    then CONFIG.COL_OUT_NRM    = data.colOutNrm    end
-        if data.colOutCrit   then CONFIG.COL_OUT_CRIT   = data.colOutCrit   end
-        if data.colInc       then CONFIG.COL_INCOMING   = data.colInc       end
-        if data.colHeal      then CONFIG.COL_HEAL       = data.colHeal      end
-        if data.colCC        then CONFIG.COL_CC         = data.colCC        end
-        if data.colZealCrit  then CONFIG.COL_ZEAL_CRIT  = data.colZealCrit  end
-        if data.colSkillLbl  then CONFIG.COL_SKILL_LABEL= data.colSkillLbl  end
+        -- ~= nil (not truthiness) so saved `false` booleans still apply
+        for _, e in ipairs(SETTINGS_SCHEMA) do
+            if data[e.key] ~= nil then CONFIG[e.field] = data[e.key] end
+        end
+        -- Restore the player's in-game custom log filters: merge into IGNORE_LOOKUP
+        -- (the single source IsIgnoredBuff checks) and keep an ordered display list.
+        if type(data.customFilters) == "table" then
+            for _, nm in ipairs(data.customFilters) do
+                local ln = (type(nm) == "string" and nm ~= "") and string.lower(nm) or nil
+                if ln and not IGNORE_LOOKUP[ln] then
+                    IGNORE_LOOKUP[ln] = true
+                    CONFIG._customFilters[#CONFIG._customFilters + 1] = nm
+                end
+            end
+        end
+        -- Restore defaults the player DISABLED (tri-state false = force-allow). These live
+        -- here in settings.txt, not main.lua, so they persist across addon updates.
+        if type(data.disabledDefaults) == "table" then
+            for _, nm in ipairs(data.disabledDefaults) do
+                if type(nm) == "string" and nm ~= "" then IGNORE_LOOKUP[string.lower(nm)] = false end
+            end
+        end
+        if data.showDefaults ~= nil then CONFIG._showDefaults = data.showDefaults end
     end
 end
 
 local function SaveSettings()
     local s = {}
-    if wButton then
-        local x, y = wButton:GetOffset()
-        s.btnX = x
-        s.btnY = y
+    -- Window positions read live from the widgets
+    if wButton  then s.btnX,  s.btnY  = wButton:GetOffset()  end
+    if wLive    then s.liveX, s.liveY = wLive:GetOffset()    end
+    if wHistory then s.histX, s.histY = wHistory:GetOffset() end
+    -- CONFIG-backed options
+    for _, e in ipairs(SETTINGS_SCHEMA) do
+        s[e.key] = CONFIG[e.field]
     end
-    if wLive then
-        local x, y = wLive:GetOffset()
-        s.liveX = x
-        s.liveY = y
-    end
-    s.liveW      = CONFIG.LIVE_WIDTH
-    s.liveH      = CONFIG.LIVE_HEIGHT
-    s.scanFreq   = CONFIG.SCAN_FREQ
-    s.showHeals  = CONFIG.SHOW_HEALS
-    s.colOutNrm   = CONFIG.COL_OUT_NRM
-    s.colOutCrit  = CONFIG.COL_OUT_CRIT
-    s.colInc      = CONFIG.COL_INCOMING
-    s.colHeal     = CONFIG.COL_HEAL
-    s.colCC       = CONFIG.COL_CC
-    s.colZealCrit = CONFIG.COL_ZEAL_CRIT
-    s.colSkillLbl = CONFIG.COL_SKILL_LABEL
+    s.customFilters = CONFIG._customFilters   -- player's in-game custom log filters
+    -- Defaults the player disabled = IGNORE_LOOKUP entries flagged false.
+    local dis = {}
+    for k, v in pairs(IGNORE_LOOKUP) do if v == false then dis[#dis + 1] = k end end
+    s.disabledDefaults = dis
+    s.showDefaults = CONFIG._showDefaults
     pcall(function() api.File:Write(SETTINGS_FILE, s) end)
 end
 
@@ -465,6 +566,14 @@ local dotSkills = {
 -- Skill damage type table: authoritative data from game JSON (skill_damage_types.lua),
 -- merged with supplemental entries for custom content, procs, and DoT debuff names.
 local SKILL_DAMAGE_TYPES = skillTypesLoaded and skillTypesData or {}
+-- Basic Combat attacks aren't in the skillcalc data and arrive as SPELL_DAMAGE, so without an
+-- explicit type they fall through to the "SPELL -> Magic" guess (e.g. Shoot Arrow tagged Magic).
+-- They're physical; pin them. (Override table is checked before the auto-learned cache.)
+SKILL_DAMAGE_TYPES["Shoot Arrow"]   = "Ranged"
+SKILL_DAMAGE_TYPES["Ranged Attack"] = "Ranged"
+SKILL_DAMAGE_TYPES["Kick"]          = "Melee"
+SKILL_DAMAGE_TYPES["Melee Attack"]  = "Melee"
+SKILL_DAMAGE_TYPES["Auto Attack"]   = "Melee"
 
 -- Maps skill name -> skill tree name, used to infer observed trees from combat log.
 local SKILL_TO_TREE = {
@@ -554,6 +663,136 @@ local TYPE_SHORT = { Magic="Magic", Physical="Phys", Melee="Melee", Ranged="Rang
 --  HELPER FUNCTIONS
 -- ============================================================================
 
+-- Rebuilds the lowercased name -> "teamN" map for the current party/raid.
+-- team1..team50 are valid unit tags (api-docs-patch243.lua:700-705); pcall-guarded
+-- because tags for empty slots / when solo return nothing.
+-- name(lower) -> role, used for the sessions-list role icon. On CONFIG (no new local;
+-- the main chunk is at Lua's 200-local cap). Resolves role the robust way -- from the
+-- unit's skillset table (GetUnitInfoById().class) like Enhanced_X_UP_Plus does -- and
+-- falls back to the class-name lookup. roleOf is a local of this function, so it costs
+-- no main-chunk local. Cache-once per name; nil results retry on a later refresh.
+local function RefreshAllyRoster()
+    local newRoster = {}
+    local n = 0
+    CONFIG._nameRole = CONFIG._nameRole or {}
+    CONFIG._nameClassTbl = CONFIG._nameClassTbl or {}   -- name -> {skillsetId,...} for class icons
+    -- Resolve+cache a unit's skillset table (for the 3 class icons) and role (fallback
+    -- glyph). Local to this function, so it costs no main-chunk local. Cache-once.
+    local function capture(tag, lname)
+        if CONFIG._nameClassTbl[lname] then return end  -- have icons; keep retrying until we do
+        local okId, uid = pcall(function() return api.Unit:GetUnitId(tag) end)
+        if okId and uid then
+            local okI, info = pcall(function() return api.Unit:GetUnitInfoById(uid) end)
+            if okI and type(info) == "table" and type(info.class) == "table" then
+                local ids = {}
+                for _, v in pairs(info.class) do
+                    local id = tonumber(v); if id and id >= 1 and id <= 10 then ids[#ids + 1] = id end
+                end
+                if #ids > 0 then
+                    CONFIG._nameClassTbl[lname] = ids
+                    CONFIG._nameRole[lname] = ROLE_DATA.GetRoleFromClassTable(ids)
+                    return
+                end
+            end
+        end
+        -- Fallback: class-name lookup gives a role (named tanks/healers, else dps), no icons.
+        local okC, cls = pcall(function() return api.Ability:GetUnitClassName(tag) end)
+        if okC and cls and cls ~= "" and tostring(cls):lower() ~= "pending" then
+            CONFIG._nameRole[lname] = ROLE_DATA.GetRoleFromClass(tostring(cls))
+        end
+    end
+    for i = 1, 50 do
+        local tag = "team" .. i
+        local ok, nm = pcall(function() return api.Unit:UnitName(tag) end)
+        if ok and nm and nm ~= "" then
+            newRoster[string.lower(nm)] = tag
+            n = n + 1
+            capture(tag, string.lower(nm))
+        end
+    end
+    -- Your own build too (for self-heal sessions listed under your name)
+    local okP, pn = pcall(function() return api.Unit:UnitName("player") end)
+    if okP and pn and pn ~= "" then capture("player", string.lower(pn)) end
+    allyRoster = newRoster
+    return n
+end
+
+-- Returns the "teamN" tag for a party/raid member name, or nil if not grouped with them.
+local function GetAllyTag(name)
+    if not name then return nil end
+    return allyRoster[string.lower(name)]
+end
+
+-- Classify a unit by name (cached on CONFIG._nameType): "ally" (your party/raid roster),
+-- "enemy" (a hostile PLAYER) or "mob" (non-player). Ally is exact. Enemy-vs-mob is best-effort:
+-- when we have the unit's id we read its class table (players carry skillset ids, mobs don't);
+-- without an id we fall back to a name heuristic and DON'T cache, so it upgrades once the id is seen.
+CONFIG._classifyUnit = function(name, unitId)
+    if not name or name == "" or name == "Unknown" then return "mob" end
+    local ln = string.lower(name)
+    CONFIG._nameType = CONFIG._nameType or {}
+    local cached = CONFIG._nameType[ln]
+    if cached then return cached end
+    if GetAllyTag(name) then CONFIG._nameType[ln] = "ally"; return "ally" end
+    if unitId and unitId ~= "0" and unitId ~= "" then
+        local okI, info = pcall(function() return api.Unit:GetUnitInfoById(unitId) end)
+        if okI and type(info) == "table" then
+            local ut = string.lower(tostring(info.type or ""))
+            -- Mount/pet detection off the unit's TYPE (same id table). CONFIRMED via type_probe: a
+            -- mount/battle-pet reports type=="mate" by id (e.g. "Stormwraith Kirin"). It's buff-immune
+            -- and readable for ANY feed unit -- unlike move_speed, which came back nil by id (and
+            -- varies per mount + with buffs anyway). mount/slave/vehicle kept as defensive extras.
+            if ut == "mate" or ut:find("mount", 1, true) or ut:find("slave", 1, true) or ut:find("vehicle", 1, true) then
+                CONFIG._nameMount = CONFIG._nameMount or {}; CONFIG._nameMount[ln] = true
+            end
+            -- type "character" = a real player; faction "friendly"/"hostile" splits ally vs enemy.
+            -- Anything else with a unit table (npc/monster) is a mob. Proven reliable via the probe.
+            if ut == "character" then
+                local who = (tostring(info.faction) == "hostile") and "enemy" or "ally"
+                CONFIG._nameType[ln] = who; return who
+            elseif info.type ~= nil then
+                CONFIG._nameType[ln] = "mob"; return "mob"
+            end
+        end
+    end
+    return (string.find(name, " ") and "mob") or "enemy"  -- heuristic; uncached so it can upgrade
+end
+
+-- Faction -> "side" map for RELATIVE enemy colouring (pink vs red). The game colours nameplates
+-- relative to YOU, so we mirror it: same side = green, then pink/red depends on both your faction
+-- and theirs. EDIT THIS to add player-nations; anything unmapped falls back to red. Keys lowercase.
+CONFIG._factionSide = {
+    ["pirate"]            = "pirate",
+    ["nuia"]              = "west",
+    ["haranya"]           = "east",
+    ["dreamwaker exiles"] = "west",   -- confirmed (your nation)
+    ["crescent throne"]   = "east",   -- Haranya capital (best guess -- correct if wrong)
+    -- ["andelph"]        = "west/east",   -- add the rest as you confirm them
+}
+-- Resolve the player's own side once (GetFactionName("player") works for the local player). Retries
+-- until it returns a value, so a not-yet-loaded read doesn't lock in a wrong answer.
+CONFIG._resolvePlayerSide = function()
+    if CONFIG._playerSide then return end
+    local okPF, pf = pcall(function() return api.Unit:GetFactionName("player") end)
+    if okPF and pf and pf ~= "" then
+        CONFIG._playerFaction = tostring(pf)
+        CONFIG._playerSide = CONFIG._factionSide[string.lower(CONFIG._playerFaction)] or "nation"
+    end
+end
+-- Colour for a HOSTILE unit, relative to your faction. Pirate viewer: East=pink, West=red.
+-- Nation viewer: enemy Pirate=pink, everyone else=red. Unknown faction -> red. Returns r,g,b.
+CONFIG._enemyColor = function(fac)
+    CONFIG._resolvePlayerSide()
+    local side = fac and CONFIG._factionSide[string.lower(tostring(fac))] or nil
+    if CONFIG._playerSide == "pirate" then
+        if side == "east" then return 0.945, 0.482, 0.722 end   -- pink #F17BB8
+        return 1.000, 0.275, 0.275                              -- red  #FF4646 (west / unknown)
+    else
+        if side == "pirate" then return 0.945, 0.482, 0.722 end -- pink #F17BB8
+        return 1.000, 0.275, 0.275                              -- red  #FF4646
+    end
+end
+
 local function GetTimestamp()
     return cachedTimestamp
 end
@@ -607,16 +846,6 @@ local function MakeDraggable(dragHandle, parentWindow, onDragStop)
     end)
 end
 
-local function GetNextColorName(currentName)
-    local idx = 1
-    for i, name in ipairs(PALETTE_KEYS) do
-        if name == currentName then idx = i break end
-    end
-    idx = idx + 1
-    if idx > #PALETTE_KEYS then idx = 1 end
-    return PALETTE_KEYS[idx]
-end
-
 -- Fills target-side snapshot fields from a UnitInfo table + ModifierInfo table
 local function ApplyTargetSnapshot(snap, tInfo, tModInfo)
     tInfo    = tInfo    or {}
@@ -663,11 +892,18 @@ local function GetOrCreateOutgoing(unitID, targetName, now)
                 ApplyTargetSnapshot(existing.statSnapshot, tInfo, tModInfo)
                 if not existing.targetGS then existing.targetGS = tonumber(tInfo.gear_score) or nil end
                 if not existing.targetClass then
+                    -- ONLY GetUnitClassName gives a real class (and only for actual PLAYERS); it
+                    -- returns "Pending" for mobs/mounts/NPCs. UnitClass lies ("mage" for everything),
+                    -- so we never fall back to it -- that was tagging mounts/mobs as players.
                     local okC, cls = pcall(function() return api.Ability:GetUnitClassName("target") end)
-                    if not okC or not cls or cls == "" or cls:lower() == "pending" then
-                        okC, cls = pcall(function() return api.Unit:UnitClass("target") end)
-                    end
                     if okC and cls and cls ~= "" and cls:lower() ~= "pending" then existing.targetClass = tostring(cls) end
+                end
+                -- Weak fallback mount tag for the unit you're TARGETING: fast move_speed AND not a
+                -- confirmed player (GetUnitClassName gave no real class). Speed is unreliable (varies
+                -- by mount + buffs), so it only applies when type-based detection hasn't already
+                -- flagged it, and never to a real player -- avoids tagging a speed-buffed ally/enemy.
+                if not existing.targetClass and (tonumber(tInfo.move_speed) or 0) >= 9 then
+                    CONFIG._nameMount = CONFIG._nameMount or {}; CONFIG._nameMount[string.lower(existing.name or "")] = true
                 end
                 if not existing.targetMaxHp then
                     local okH, mhp = pcall(function() return api.Unit:UnitMaxHealth("target") end)
@@ -693,12 +929,16 @@ local function GetOrCreateOutgoing(unitID, targetName, now)
     if not ok3 then tHp = nil end
     local ok4, tMaxHp = pcall(function() return api.Unit:UnitMaxHealth("target") end)
     if not ok4 then tMaxHp = nil end
+    -- Real class only from GetUnitClassName (players); "Pending" => mob/mount/NPC. No UnitClass
+    -- fallback -- it returns "mage" for everything, which mis-tagged mounts/mobs as players.
     local ok5, tClass = pcall(function() return api.Ability:GetUnitClassName("target") end)
-    if not ok5 or not tClass or tClass == "" or tClass:lower() == "pending" then
-        ok5, tClass = pcall(function() return api.Unit:UnitClass("target") end)
-        if not ok5 then tClass = nil end
+    if not ok5 or not tClass or tClass == "" or tostring(tClass):lower() == "pending" then tClass = nil end
+    -- Weak fallback mount tag for your target: fast move_speed AND not a confirmed player. Speed
+    -- is unreliable (mount + player speeds both vary with buffs), so it never overrides a real
+    -- class and never tags a speed-buffed player. Type-based detection (in _classifyUnit) is primary.
+    if not tClass and (tonumber(targetInfo.move_speed) or 0) >= 9 then
+        CONFIG._nameMount = CONFIG._nameMount or {}; CONFIG._nameMount[string.lower(targetName or "")] = true
     end
-    if tClass and tClass:lower() == "pending" then tClass = nil end
 
     -- patch 243+: zone group and targeting info
     local okZ, zoneGroup = pcall(function() return api.Unit:GetCurrentZoneGroup() end)
@@ -815,18 +1055,26 @@ end
 
 local function RebuildLiveLabels()
     if not wLive or not liveBodyWidget then return end
-    -- Layout pass: only runs when dimensions changed (resize buttons or first call).
+    local icons = CONFIG.SHOW_ICONS ~= false   -- show skill icons in the live feed?
+    local tx = icons and 30 or 10               -- text x-offset: leave room for the icon when on
+    -- Layout pass: only runs when dimensions changed (resize, or SHOW_ICONS toggled -> dirty).
     if liveLayoutDirty then
         liveLayoutDirty = false
         wLive:SetExtent(CONFIG.LIVE_WIDTH, CONFIG.LIVE_HEIGHT)
-        local bodyHeight = CONFIG.LIVE_HEIGHT - 30
+        -- History/Options now live in the footer, so the IDLE/IN COMBAT badge always has room up top
+        -- (it no longer overlaps right-side buttons) -- show it at every width.
+        do
+            local sl = liveTitleLabel and liveTitleLabel.statusLabel
+            if sl then sl:Show(true) end
+        end
+        local bodyHeight = CONFIG.LIVE_HEIGHT - 30 - 26   -- minus header (30) + footer (26)
         CONFIG.VISIBLE_ROWS_LIVE = math.floor((bodyHeight - 20) / CONFIG.LINE_HEIGHT)
         for i = 1, 50 do
             if i <= CONFIG.VISIBLE_ROWS_LIVE then
+                local rowY = 10 + ((i-1) * CONFIG.LINE_HEIGHT)
                 local lbl = liveLabels[i]
                 if not lbl then
                     lbl = liveBodyWidget:CreateChildWidget("label", "LiveLbl"..i, 0, true)
-                    lbl:AddAnchor("TOPLEFT", liveBodyWidget, 10, 10 + ((i-1) * CONFIG.LINE_HEIGHT))
                     lbl:SetLimitWidth(true)
                     if lbl.style then
                         lbl.style:SetAlign(ALIGN.LEFT)
@@ -835,14 +1083,25 @@ local function RebuildLiveLabels()
                     end
                     liveLabels[i] = lbl
                 end
-                lbl:SetExtent(CONFIG.LIVE_WIDTH - 20, CONFIG.LINE_HEIGHT)
+                lbl:RemoveAllAnchors()
+                lbl:AddAnchor("TOPLEFT", liveBodyWidget, tx, rowY)
+                lbl:SetExtent(CONFIG.LIVE_WIDTH - tx - 10, CONFIG.LINE_HEIGHT)
                 lbl:Show(true)
+                -- Per-row skill icon at the left (shown/hidden + textured in the text pass).
+                if icons and CONFIG._clpMakeIcon then
+                    local ic = liveIcons[i] or CONFIG._clpMakeIcon(liveBodyWidget, 16)
+                    liveIcons[i] = ic
+                    if ic then ic:RemoveAllAnchors(); ic:AddAnchor("TOPLEFT", liveBodyWidget, 8, rowY + 1); ic:Show(false) end
+                elseif liveIcons[i] then
+                    liveIcons[i]:Show(false)
+                end
             else
                 if liveLabels[i] then liveLabels[i]:Show(false) end
+                if liveIcons[i] then liveIcons[i]:Show(false) end
             end
         end
     end
-    -- Text pass: always runs, updates visible label text and color.
+    -- Text pass: always runs, updates visible label text + color + per-line icon.
     local startIdx = #liveBuffer - CONFIG.VISIBLE_ROWS_LIVE + 1
     if startIdx < 1 then startIdx = 1 end
     local lblIdx = 1
@@ -855,9 +1114,264 @@ local function RebuildLiveLabels()
             end
             liveLabels[lblIdx]:SetText(timeStr .. e.text)
             if liveLabels[lblIdx].style then liveLabels[lblIdx].style:SetColor(e.r, e.g, e.b, 1) end
+            local ic = liveIcons[lblIdx]
+            if ic then
+                local p
+                if icons then
+                    if e.death then p = CONFIG._ovIcon("__death__")        -- skull on death lines
+                    elseif e.skill and CONFIG._resolveSkillIcon then p = CONFIG._resolveSkillIcon(e.skill, e.dmgTag, e.varIcon) end
+                end
+                if p and p ~= "" then CONFIG._clpSetIcon(ic, p) else ic:Show(false) end
+            end
         end
         lblIdx = lblIdx + 1
     end
+end
+
+-- ============================================================================
+--  ICON INFRASTRUCTURE (history rows + the live feed, gated by CONFIG.SHOW_ICONS)
+-- ============================================================================
+-- Stat-line icons (armor/crit/etc.) -- loaded via a do-block onto CONFIG (no new top-level
+-- local; the main chunk is at Lua's 200-local cap). User-editable in stat_icons.lua.
+do
+    local ok, t = pcall(require, "/CombatLogPro/stat_icons")
+    if ok and type(t) == "table" then CONFIG.STAT_ICONS = t end
+end
+
+-- Per-player icon overrides written by the in-game icon picker (skill name -> icon base).
+-- Highest priority in ResolveSkillIcon. This is the file testers send back to the maintainer.
+do
+    local d = api.File:Read("CombatLogPro/icon_overrides.txt")
+    CONFIG._iconOverrides = (type(d) == "table") and d or {}
+end
+
+local ICON_ROLE = {
+    tank   = "../Addon/CombatLogPro/icons/RoleTank.png",
+    healer = "../Addon/CombatLogPro/icons/RoleHealer.png",
+    dps    = "../Addon/CombatLogPro/icons/RoleDPS.png",
+}
+-- Type glyphs + damage-type fallbacks: known-valid game .dds icons (easy to refine).
+local ICON_TYPE = {
+    enemy    = "Game\\ui\\icon\\icon_skill_wild03.dds",
+    incoming = "Game\\ui\\icon\\icon_skill_karon01.dds",
+    heal     = "Game\\ui\\icon\\icon_skill_tare01.dds",
+    recap    = "Game\\ui\\icon\\icon_skill_glider_snowflake02.dds",
+}
+local ICON_DMGTYPE = {
+    Magic    = "Game\\ui\\icon\\icon_skill_wild03.dds",
+    Spell    = "Game\\ui\\icon\\icon_skill_wild03.dds",
+    Ranged   = "Game\\ui\\icon\\icon_skill_karon01.dds",
+    Melee    = "Game\\ui\\icon\\icon_skill_tare01.dds",
+    Physical = "Game\\ui\\icon\\icon_skill_tare01.dds",
+    Heal     = "Game\\ui\\icon\\icon_skill_buff304.dds",
+}
+-- Bonus-breakdown source label -> the skill whose icon represents it (resolved via SKILL_ICONS).
+local BONUS_ICON = {
+    Zeal         = "Zeal",
+    Chanty       = "Bloody Chantey",
+    Rhythm       = "Rhythmic Renewal",
+    ["M.Circle"] = "Magic Circle",
+    HealPwr      = "Ode to Recovery",
+    Inspired     = "Inspiration Cloak",
+}
+
+local iconPathCache      = {}   -- skill name -> path or false
+local playerSkillIconMap = {}   -- your skill name -> icon path (built on Load)
+local SKILL_ICON_CATALOG = {}   -- curated name -> path (extend over time)
+local clpIconSeq         = 0    -- unique-name counter for CreateItemIconButton
+
+-- Create a small icon widget. Native icon button when available; pcall-guarded
+-- so a failure never breaks the row (the text still renders).
+local function ClpMakeIcon(parent, size)
+    if not parent then return nil end
+    clpIconSeq = clpIconSeq + 1
+    local icon
+    if CreateItemIconButton then
+        local ok, made = pcall(function() return CreateItemIconButton("ClpIcon" .. clpIconSeq, parent) end)
+        if ok then icon = made end
+    end
+    if not icon then
+        local ok, made = pcall(function() return parent:CreateImageDrawable(ICON_ROLE.dps, "overlay") end)
+        if ok then icon = made end
+    end
+    if not icon then return nil end
+    pcall(function() icon:SetExtent(size, size) end)
+    return icon
+end
+
+-- Point an icon at a texture path. nil hides it entirely; "" (unmapped skill) keeps the slot present
+-- and CLICKABLE (so you can still click it to assign an icon) but transparent via alpha 0 -- so the
+-- default white item-slot frame disappears into the background instead of showing an empty box.
+local function ClpSetIcon(icon, path)
+    if not icon then return end
+    if not path then pcall(function() icon:Show(false) end); return end
+    if path == "" then
+        if F_SLOT and F_SLOT.SetIconBackGround then pcall(function() F_SLOT.SetIconBackGround(icon, "") end) end
+        pcall(function() icon:SetAlpha(0) end)        -- invisible but still receives clicks
+        pcall(function() icon:Show(true) end)
+        return
+    end
+    local ok = false
+    if F_SLOT and F_SLOT.SetIconBackGround then
+        ok = pcall(function() F_SLOT.SetIconBackGround(icon, tostring(path)) end)
+    end
+    if not ok and icon.SetTgaTexture then
+        ok = pcall(function() icon:SetTgaTexture(tostring(path)) end)
+    end
+    if not ok then pcall(function() icon:SetTextureInfo(tostring(path)) end) end
+    pcall(function() icon:SetAlpha(1) end)            -- restore in case the slot was previously empty
+    pcall(function() icon:Show(true) end)
+end
+
+-- Name-list icon: role for known players, type glyph otherwise.
+-- Resolve a universal icon-override key (e.g. "__mob__", "__kill__", "__died__") to a game icon
+-- path, or "" (a blank-but-clickable slot). One picker assignment then applies to ALL of that
+-- kind -- every mob shares "__mob__", every kill marker shares "__kill__". Stored on CONFIG.
+-- Official baked-in defaults for the universal keys (maintainer's chosen icons). icon_overrides.txt
+-- still overrides per-tester; keys with no default and no override resolve to "" (blank slot).
+CONFIG._iconDefaults = {
+    ["__mob__"]   = "icon_skill_buff265",  -- shared mob icon
+    ["__death__"] = "icon_skill_buff96",   -- session-death/skull marker (maintainer's chosen icon, baked in)
+    ["__bloodlust__"] = "icon_skill_buff97", -- the actual "Bloodlust Mode" buff icon (id 1482, from tester scan); override in icon_overrides.txt
+    ["__player__"] = "icon_skill_buff300", -- player-contributor icon (baked in)
+    -- Fight-list category icons (sidebar Fight rows). Baked-in defaults; the in-game "Fight Icons"
+    -- picker was removed. __duel__ is replaced at runtime by the real Duel buff icon (_resolveDuelIcon).
+    ["__pve__"]   = "icon_skill_buff121",  -- PvE / mob fight (baked)
+    ["__pvp__"]   = "icon_skill_buff319",  -- PvP / enemy-player fight (baked)
+    ["__duel__"]  = "icon_skill_hatred25", -- duel / "mock fight" (placeholder; replaced by _resolveDuelIcon)
+}
+CONFIG._ovIcon = function(key, default)
+    local ov = CONFIG._iconOverrides and CONFIG._iconOverrides[key]
+    if ov then return "Game\\ui\\icon\\" .. ov .. ".dds" end
+    if default then return default end
+    local d = CONFIG._iconDefaults and CONFIG._iconDefaults[key]
+    return d and ("Game\\ui\\icon\\" .. d .. ".dds") or ""
+end
+
+-- Use the actual "Duel" buff icon (id 1834/3649) as the __duel__ category default -- the real game
+-- icon beats a placeholder. Lazy + cached: runs on the first duel-row render (GetBuffTooltip is
+-- reliable in-game). The picker override still wins; falls back to the placeholder if never resolved.
+CONFIG._resolveDuelIcon = function()
+    if CONFIG._duelIconDone then return end
+    CONFIG._duelIconTries = (CONFIG._duelIconTries or 0) + 1
+    for _, id in ipairs({ 1834, 3649 }) do
+        local okT, t = pcall(function() return api.Ability:GetBuffTooltip(id) end)
+        if okT and type(t) == "table" and t.path then
+            local base = tostring(t.path):match("([^\\/]+)%.dds$")
+            if base and base ~= "" then CONFIG._iconDefaults["__duel__"] = base; CONFIG._duelIconDone = true; return end
+        end
+    end
+    if CONFIG._duelIconTries >= 5 then CONFIG._duelIconDone = true end  -- give up, keep the placeholder
+end
+
+-- Quick mob/player reference: which shared, assignable icon a name uses. Player = a detected
+-- role/build, OR an ally you healed/tracked (Heal/Recap); everything else is a mob/enemy. Both
+-- "__player__" and "__mob__" are single icons assignable via the picker (blank by default).
+local function ResolveNameKey(group)
+    local ln = string.lower(group.name or "")
+    if CONFIG._nameMount and CONFIG._nameMount[ln] then return "__mount__" end  -- fast unit = mount
+    -- Floodgates: recaps now cover enemies/mobs too, so trust the classified `who` first.
+    if group.who == "mob" then return "__mob__" end
+    if group.who == "ally" or group.who == "enemy" then return "__player__" end
+    local ct = CONFIG._nameClassTbl and CONFIG._nameClassTbl[ln]
+    if group.role or ct or group.kind == "Heal" then return "__player__" end
+    return "__mob__"
+end
+
+-- Per-row skill icon: your skills -> curated catalog -> damage-type fallback.
+local function ResolveSkillIcon(skill, dmgTag, variantIcon)
+    if not skill then return nil end
+    -- Ancestral-variant icon: passed IN per-line (frozen at log time, only for YOUR own casts -- so
+    -- an enemy's same-named cast keeps the base icon, and switching variants doesn't re-skin old
+    -- lines). Beats the base skillcalc icon, but still yields to an explicit user override. Not
+    -- cached -- the same skill resolves differently for your line vs an incoming one.
+    if variantIcon then
+        if CONFIG._iconOverrides and CONFIG._iconOverrides[skill] then
+            return "Game\\ui\\icon\\" .. CONFIG._iconOverrides[skill] .. ".dds"
+        end
+        return "Game\\ui\\icon\\" .. variantIcon .. ".dds"
+    end
+    local cached = iconPathCache[skill]
+    if cached ~= nil then return cached or nil end
+    local path
+    -- 0. User/tester override from the in-game icon picker (icon_overrides.txt) -- wins.
+    if CONFIG._iconOverrides and CONFIG._iconOverrides[skill] then
+        path = "Game\\ui\\icon\\" .. CONFIG._iconOverrides[skill] .. ".dds"
+    end
+    -- 1. Authoritative: the skillcalc-sourced icon name for this skill.
+    if not path then
+        local base = SKILL_ICONS[skill]
+        if base then path = "Game\\ui\\icon\\" .. base .. ".dds" end
+    end
+    -- 2. Real icon via the skill's known buff/debuff entry. buffNameToId only holds VALID
+    -- ids (from the static buff DB), so this native call is safe -- never garbage input.
+    if not path then
+        local bid = buffNameToId[skill]
+        if bid then
+            local okT, tip = pcall(function() return api.Ability:GetBuffTooltip(bid) end)
+            if okT and type(tip) == "table" and tip.path and tip.path ~= "" then path = tip.path end
+        end
+    end
+    -- 3. BLANK by default: no glyph fallback. Unmapped skills render empty -- click the slot
+    -- to assign one via the icon picker (writes icon_overrides.txt for the maintainer).
+    iconPathCache[skill] = path or false
+    return path
+end
+
+-- Expose the icon helpers on CONFIG so RebuildLiveLabels (defined earlier in the file than these
+-- locals, so it can't capture them as upvalues) can use them. Set at load, before any render.
+CONFIG._resolveSkillIcon = ResolveSkillIcon
+CONFIG._clpMakeIcon = ClpMakeIcon
+CONFIG._clpSetIcon = ClpSetIcon
+
+-- Build name->icon for your own skills from the skill bar. The id field name is
+-- confirmed in-game (id / skillId / buff_id); all candidates are tried.
+local function BuildPlayerSkillIcons()
+    -- Reverse the scanner's buffDB (id->name) into a name->buff_id map, so a combat-log
+    -- skill name that exists as a known buff/debuff can resolve its REAL icon safely via
+    -- GetBuffTooltip(valid id). Only valid ids are ever passed to the native call.
+    for id, name in pairs(buffDB) do
+        if name and name ~= "" and not buffNameToId[name] then buffNameToId[name] = id end
+    end
+end
+
+-- Split a session's bonus-breakdown lines ("A +N | B +N") into one entry per source,
+-- tagged with bonusLabel so the archive render can show each source's icon. Render-only;
+-- the stored logs and the live feed are untouched.
+local function ExpandArchive(logs)
+    -- Drop the hidden duplicate damage line for the session view; keep the bonus breakdown
+    -- inline on one line (no per-source split). The live feed / stored logs are untouched.
+    local out = {}
+    for _, e in ipairs(logs or {}) do
+        if not e.archiveHide then out[#out + 1] = e end
+    end
+    return out
+end
+
+-- Size + position the history scrollbar thumb from the current scroll offset. The track spans
+-- between the up/down arrows; histBody is HIST_HEIGHT-58 tall (below the category bar), and the
+-- two 40px arrow buttons (+5 margins +4 gaps) leave HIST_HEIGHT-156 for the track.
+local function UpdateScrollThumb()
+    if not scrollTrack or not scrollThumb then return end
+    local total   = #displayBuffer
+    local visible = CONFIG.VISIBLE_ROWS_HIST
+    local trackH  = CONFIG.HIST_HEIGHT - 156
+    if total <= visible or trackH <= 24 then
+        scrollThumb:Show(false)         -- everything fits: no thumb
+        CONFIG._scrollRange = 0
+        return
+    end
+    scrollThumb:Show(true)
+    local thumbH = math.max(24, math.floor(trackH * visible / total))
+    if thumbH > trackH then thumbH = trackH end
+    local range     = trackH - thumbH
+    local maxOffset = total - visible
+    local y = (maxOffset > 0) and math.floor((logScrollOffset / maxOffset) * range + 0.5) or 0
+    if y < 0 then y = 0 elseif y > range then y = range end
+    scrollThumb:SetExtent(8, thumbH)
+    scrollThumb:RemoveAllAnchors()
+    scrollThumb:AddAnchor("TOP", scrollTrack, 0, y)
+    CONFIG._scrollRange = range          -- cached for the drag handler
 end
 
 local function UpdateHistoryDisplay()
@@ -867,18 +1381,167 @@ local function UpdateHistoryDisplay()
     if maxOffset < 0 then maxOffset = 0 end
     if logScrollOffset > maxOffset then logScrollOffset = maxOffset end
     if logScrollOffset < 0 then logScrollOffset = 0 end
+    UpdateScrollThumb()
+    -- Every ARCHIVE line gets a clickable icon slot. Tester override (icon_overrides.txt,
+    -- keyed by this string) wins; else the resolved skill/stat icon; else "" = a blank but
+    -- still-clickable empty frame -- so EVERY row has an icon space you can assign later.
+    local function setLineIcon(icon, key, defaultPath)
+        if not icon then return end
+        icon.clpSkill = key
+        local path = defaultPath
+        if key and CONFIG._iconOverrides and CONFIG._iconOverrides[key] then
+            path = "Game\\ui\\icon\\" .. CONFIG._iconOverrides[key] .. ".dds"
+        end
+        ClpSetIcon(icon, path or "")
+    end
+    -- Move a row's icon between the normal left column (x=5) and the inline recap column.
+    -- Re-anchors only on change (no churn while scrolling same-type rows).
+    local function setIconColumn(icon, i, recap)
+        if not icon or not CONFIG._histBody then return end
+        local wantX = recap and CONFIG.RECAP_ICON_X or 5
+        if icon.clpIconX ~= wantX then
+            icon:RemoveAllAnchors()
+            icon:AddAnchor("TOPLEFT", CONFIG._histBody, wantX, 9 + ((i-1) * CONFIG.HIST_ROW_H))
+            icon.clpIconX = wantX
+        end
+    end
     for i = 1, CONFIG.VISIBLE_ROWS_HIST do
         local dataIndex = logScrollOffset + i
         local entry = displayBuffer[dataIndex]
         local lbl = historyLabels[i]
-        if entry then
-            local timeStr = ""
-            if CONFIG.SHOW_TIMESTAMP and entry.time then
-                timeStr = entry.time
+        local icon = historyIcons[i]
+        -- Raid Meter bar: width = entry.barPct of the row area (set only on meter rows); 0 = hidden.
+        do
+            local bar = CONFIG._histBars and CONFIG._histBars[i]
+            if bar then
+                local bp = entry and entry.barPct
+                local wantW = bp and math.floor(bp * (CONFIG.HIST_WIDTH - CONFIG.SIDEBAR_WIDTH - 64)) or 0  -- -64 leaves room for the scrollbar
+                if bar.clpBarW ~= wantW then
+                    bar.clpBarW = wantW
+                    local y0 = 8 + ((i - 1) * CONFIG.HIST_ROW_H)
+                    pcall(function()
+                        bar:RemoveAllAnchors()
+                        bar:AddAnchor("TOPLEFT", CONFIG._histBody, 32, y0 + 2)
+                        bar:AddAnchor("BOTTOMRIGHT", CONFIG._histBody, "TOPLEFT", 32 + wantW, y0 + CONFIG.HIST_ROW_H - 2)
+                    end)
+                end
             end
-            lbl:SetText(timeStr .. entry.text)
-            if lbl.style then lbl.style:SetColor(entry.r, entry.g, entry.b, 1) end
+        end
+        -- Default each row to the normal single-label layout; the recap branch opts in.
+        -- (Icon column is set per-branch so the re-anchor guard avoids churn on stable rows.)
+        if CONFIG._recapL and CONFIG._recapL[i] then CONFIG._recapL[i]:Show(false) end
+        if CONFIG._recapR and CONFIG._recapR[i] then CONFIG._recapR[i]:Show(false) end
+        if entry then
+            -- Timestamp shown once per event block: a line whose second matches the line above blanks
+            -- "[HH:MM:SS]" to aligned spaces, so the hit detail + breakdown sit under their header
+            -- instead of repeating it. Computed here so EVERY branch -- including the columnar
+            -- session/skill-row drill-down -- renders it the same way the Live Log does.
+            local timeStr = ""
+            if CONFIG.SHOW_TIMESTAMP and entry.time and entry.time ~= "" then
+                local prevEntry = displayBuffer[dataIndex - 1]
+                if prevEntry and prevEntry.time and tostring(prevEntry.time) == tostring(entry.time) then
+                    timeStr = string.rep(" ", #tostring(entry.time))
+                else
+                    timeStr = tostring(entry.time)
+                end
+            end
+            if viewingMode == "ARCHIVE" and entry.skill and not entry.detailOnly then
+                -- Skill row: icon + hit columns (damage hit) OR the original text (cc/debuff/miss).
+                setLineIcon(icon, entry.skill, ResolveSkillIcon(entry.skill, entry.dmgTag, entry.varIcon)); setIconColumn(icon, i, false)
+                if entry.damage then
+                    local hitStr = "Hit"
+                    if (entry.hitType and string.find(string.upper(tostring(entry.hitType)), "CRIT"))
+                       or string.find(tostring(entry.text), "Crit") then hitStr = "Crit" end
+                    local hpStr = tostring(entry.text):match("%[(%d+)%%%]")
+                    hpStr = hpStr and (hpStr .. "%") or ""
+                    lbl:SetText(timeStr .. string.format("%-16s %7d  %-4s %5s",
+                        Truncate(entry.skill, 16), entry.damage or 0, hitStr, hpStr))
+                else
+                    lbl:SetText(timeStr .. tostring(entry.text))
+                end
+                if lbl.style then lbl.style:SetColor(entry.r, entry.g, entry.b, 1) end
+            elseif viewingMode == "ARCHIVE" and entry.detailOnly then
+                -- Bonus sub-line: the source's icon when it maps to a known skill (Zeal, etc.),
+                -- otherwise a blank clickable slot keyed by the source label.
+                local bskill = entry.bonusLabel and BONUS_ICON[entry.bonusLabel]
+                setLineIcon(icon, entry.bonusLabel, bskill and ResolveSkillIcon(bskill) or ""); setIconColumn(icon, i, false)
+                lbl:SetText(timeStr .. (tostring(entry.text):gsub("^%s+", "")))
+                if lbl.style then lbl.style:SetColor((entry.r or 1)*0.6, (entry.g or 1)*0.6, (entry.b or 1)*0.6, 1) end
+            elseif viewingMode == "ARCHIVE" and entry.logType == "summary" then
+                -- Summary line: EVERY line gets a clickable icon slot (blank if none resolves).
+                -- "> Skill" / "< Skill" / "+ Skill" -> skill icon; "[C] Chanty: +N" -> bonus icon;
+                -- stat lines (armor / crit / modifiers / ...) -> keyword icon; anything else (Total
+                -- DMG, Shields absorbed, dividers) -> blank slot keyed by the text before the colon.
+                local txt = tostring(entry.text)
+                setIconColumn(icon, i, false)
+                local dir, iconSkill = txt:match("^%s*([><+]) (.-):")
+                if not iconSkill then
+                    local blab = txt:match("^%s*%[.-%]%s+([%w%.']+)")
+                    if blab then iconSkill = BONUS_ICON[blab] end
+                end
+                if iconSkill then
+                    -- YOUR outgoing summary skills ("> " / "+ ") get your equipped variant icon;
+                    -- incoming ("< ") stays base. Uses the CURRENT variant (the aggregate isn't frozen).
+                    local vIcon = (dir ~= "<" and CONFIG._detectedVariant) and CONFIG._detectedVariant[iconSkill] or nil
+                    setLineIcon(icon, iconSkill, ResolveSkillIcon(iconSkill, nil, vIcon) or "")
+                else
+                    -- Stable per-line key: strip leading markers ( - + > < [ ] ) and take the
+                    -- text up to the first colon, e.g. "Total DMG", "Shields absorbed", "Modifiers".
+                    local key = txt:gsub("^[%s%-%+%>%<%[%]]*", ""):match("^[^:]*") or ""
+                    key = key:gsub("%s+$", "")
+                    if key == "" then key = nil end
+                    local statPath
+                    if CONFIG.STAT_ICONS then
+                        local lower = string.lower(txt)
+                        for _, pair in ipairs(CONFIG.STAT_ICONS) do
+                            if string.find(lower, pair[1], 1, true) then
+                                statPath = "Game\\ui\\icon\\" .. pair[2] .. ".dds"; break
+                            end
+                        end
+                    end
+                    setLineIcon(icon, key, statPath or "")
+                end
+                lbl:SetText(txt)
+                if lbl.style then lbl.style:SetColor(entry.r, entry.g, entry.b, 1) end
+            else
+                -- ARCHIVE recap line ("Source -> Target — skill ±N [HP%]"): render like a player line
+                -- -- skill icon on the LEFT, the FULL text in the wide single label -- so long
+                -- "Source -> Target" combos are never clipped by a narrow middle column.
+                local rsrc, rrest = nil, nil
+                if viewingMode == "ARCHIVE" then
+                    rsrc, rrest = tostring(entry.text):match("^(.-) — (.+)$")
+                end
+                -- (timeStr computed once at the top of the row handler.)
+                if rsrc and rrest then
+                    local rskill = rrest:match("^(.-) [%+%-]%d") or rrest
+                    rskill = rskill:gsub("%s*%(Rank %d+%)$", "")  -- drop rank suffix for icon lookup
+                    setLineIcon(icon, rskill, ResolveSkillIcon(rskill) or "")
+                    setIconColumn(icon, i, false)
+                    lbl:SetText("  " .. timeStr .. rsrc .. "   " .. rrest)
+                else
+                    -- LIVE mirror (and plain ARCHIVE text): render the skill/death icon into the left
+                    -- gutter. The text label is anchored at x=32, so the icon sits in front with no
+                    -- reflow. Skill lines get a clickable slot (blank-but-assignable if unmapped),
+                    -- death lines get the skull; headers / dividers / banner / breakdown stay blank.
+                    local liveKey, livePath
+                    if CONFIG.SHOW_ICONS ~= false then
+                        if entry.death then
+                            liveKey, livePath = "__death__", CONFIG._ovIcon("__death__")
+                        elseif entry.skill and entry.skill ~= "" then
+                            liveKey, livePath = entry.skill, (ResolveSkillIcon(entry.skill, entry.dmgTag, entry.varIcon) or "")
+                        end
+                    end
+                    if liveKey then
+                        setLineIcon(icon, liveKey, livePath); setIconColumn(icon, i, false)
+                    elseif icon then
+                        icon:Show(false)
+                    end
+                    lbl:SetText(timeStr .. tostring(entry.text))
+                end
+                if lbl.style then lbl.style:SetColor(entry.r, entry.g, entry.b, 1) end
+            end
         else
+            if icon then icon:Show(false) end
             lbl:SetText("")
         end
     end
@@ -907,6 +1570,11 @@ end
 local function LogEntry(text, r, g, b, meta)
     local entry = { text = text, r = r, g = g, b = b, time = GetTimestamp() }
     if meta then for k, v in pairs(meta) do entry[k] = v end end
+    -- Freeze the variant icon: your own casts use your equipped variant, incoming uses the caller's
+    -- pre-detected meta.varIcon (see RecordLogForTarget).
+    entry.varIcon = (meta and meta.varIcon)
+                    or ((meta and meta.skill and meta.source == PLAYER_NAME and CONFIG._detectedVariant)
+                        and CONFIG._detectedVariant[meta.skill]) or nil
     liveBuffer[#liveBuffer + 1] = entry
     liveBuffer = TrimBuffer(liveBuffer, 50)
     masterBuffer[#masterBuffer + 1] = entry
@@ -928,24 +1596,143 @@ local function LogEntry(text, r, g, b, meta)
     end
 end
 
--- Split a long line into wrapped lines at word boundaries.
--- Wrap width is computed dynamically from the live label width (~7.2px per char avg font).
-local function WrapLines(text, indent)
-    local wrapWidth = math.max(40, math.floor((CONFIG.LIVE_WIDTH - 30) / 7.2))
-    if #text <= wrapWidth then return { text } end
-    indent = indent or "  "
-    local lines = {}
-    local remaining = text
-    while #remaining > wrapWidth do
-        local cut = wrapWidth
-        -- Walk back to find a space to break on
-        while cut > 1 and remaining:sub(cut, cut) ~= " " do cut = cut - 1 end
-        if cut <= 1 then cut = wrapWidth end  -- no space found, hard cut
-        table.insert(lines, remaining:sub(1, cut))
-        remaining = indent .. remaining:sub(cut + 1)
+-- ============================================================================
+--  RAID METER (feature; gated by CONFIG.RAID_METER). Per-fight aggregate of every
+--  combatant's damage/healing, keyed by source name, classified you/team/other via
+--  allyRoster. Captured during YOUR fight (inCombat) at the COMBAT_MSG tap, reset
+--  with fightData, snapshotted into CONFIG._fightMeters[fightId] at FinishFight, and
+--  surfaced in the history fight-detail as two pseudo-contributors (My Raid / Everyone)
+--  whose leaderboard reuses the existing Damage/Healing filter. Names + numbers only
+--  (the API lockdown blocks enrichment of non-target units). See raid-meter spec.
+-- ============================================================================
+CONFIG._meterAgg = CONFIG._meterAgg or {}   -- key -> { name, dmg, heal, hits, cls }
+CONFIG._meterN = CONFIG._meterN or 0
+
+CONFIG._meterReset = function()
+    CONFIG._meterAgg = {}
+    CONFIG._meterN = 0
+    CONFIG._ctQ = {}
+end
+
+CONFIG._meterClass = function(name)
+    if not name or name == "" then return "other" end
+    if name == PLAYER_NAME then return "you" end
+    if allyRoster[string.lower(name)] then return "team" end
+    return "other"
+end
+
+-- Effect-tick (HoT/DoT) caster attribution. A tick's COMBAT_MSG reports the EFFECT as the source
+-- (source == skill, e.g. "Rhythmic Renewal"), but the paired COMBAT_TEXT carries the caster's
+-- entity id. We keep a short ring of recent COMBAT_TEXTs and match a tick to its CT by TARGET +
+-- AMOUNT -- "last CT" is unreliable because dozens of HoTs interleave under raid load (proven by
+-- the DoT probe). Each match is consumed so two ticks can't claim one CT.
+CONFIG._ctQ = CONFIG._ctQ or {}
+CONFIG._ctPush = function(src, tgt, amt)
+    local q = CONFIG._ctQ
+    q[#q + 1] = { src = src, tgt = tgt, amt = amt }
+    if #q > 40 then table.remove(q, 1) end
+end
+CONFIG._resolveTickCaster = function(targetId, amount)
+    local q = CONFIG._ctQ
+    for i = #q, 1, -1 do
+        local e = q[i]
+        if e and not e.used and e.tgt == targetId and e.amt == amount
+           and e.src and e.src ~= "" and e.src ~= "0" then
+            e.used = true   -- consume the match either way
+            local okN, n = pcall(function() return api.Unit:GetUnitNameById(e.src) end)
+            return (okN and n and n ~= "") and tostring(n) or nil
+        end
     end
-    if #remaining > 0 then table.insert(lines, remaining) end
-    return lines
+    return nil
+end
+
+CONFIG._meterTap = function(sourceName, amount, isHeal)
+    local nm = sourceName
+    if nm == "" or nm == "Unknown" or nm == "unknown" then nm = nil end
+    -- Raid-only: classify first and skip anyone who isn't you or your raid. Keeps the aggregate
+    -- tiny (your raid is <50), so there's no cap and raid members can never be evicted by a flood
+    -- of nearby strangers in a siege.
+    local cls = nm and CONFIG._meterClass(nm) or "other"
+    if cls == "other" then return end
+    local key = string.lower(nm)
+    local a = CONFIG._meterAgg[key]
+    if not a then
+        a = { name = nm, dmg = 0, heal = 0, hits = 0, cls = cls }
+        CONFIG._meterAgg[key] = a
+        CONFIG._meterN = (CONFIG._meterN or 0) + 1
+    end
+    local amt = tonumber(amount) or 0
+    if isHeal then a.heal = a.heal + amt else a.dmg = a.dmg + amt end
+    a.hits = a.hits + 1
+end
+
+-- Scope-filtered, metric-sorted rows from a stored fight meter. scope: "raid"|"all".
+CONFIG._meterRows = function(fm, scope, metric)
+    if not fm or not fm.rows then return {}, 0 end
+    local list, total = {}, 0
+    for _, a in ipairs(fm.rows) do
+        local inScope = (scope == "all") or (a.cls == "you" or a.cls == "team")
+        local v = (metric == "heal") and a.heal or a.dmg
+        if inScope and v > 0 then list[#list + 1] = a; total = total + v end
+    end
+    table.sort(list, function(x, y)
+        local xv = (metric == "heal") and x.heal or x.dmg
+        local yv = (metric == "heal") and y.heal or y.dmg
+        return xv > yv
+    end)
+    return list, total
+end
+
+-- Build the right-pane line items for a fight's meter. Sections follow the existing
+-- Damage/Healing (F_WHAT_*) filter, so that toggle doubles as the metric selector.
+CONFIG._buildMeterView = function(fightId, scope)
+    local fm = CONFIG._fightMeters and CONFIG._fightMeters[fightId]
+    local out = {}
+    if not fm then return out end
+    local dur = math.max(1, fm.durSec or 1)
+    out[#out + 1] = { text = string.format("=====  Raid Meter  (%.0fs)  =====", dur), r = 0.55, g = 0.7, b = 1 }
+    local hasTeam = false
+    if fm.rows then for _, a in ipairs(fm.rows) do if a.cls == "team" then hasTeam = true; break end end end
+    local function abbr(n)
+        n = n or 0
+        if n >= 1000000 then return string.format("%.2fm", n / 1000000)
+        elseif n >= 1000 then return string.format("%.1fk", n / 1000)
+        else return string.format("%d", n) end
+    end
+    local function rowColor(cls)
+        if cls == "you" then return 0.451, 0.824, 0.200 end  -- you (green)
+        return 0.310, 0.800, 0.922                           -- raid (cyan)
+    end
+    local function section(metric, title)
+        local list, total = CONFIG._meterRows(fm, "raid", metric)
+        out[#out + 1] = { text = "  " .. title, r = 1, g = 0.85, b = 0.3 }
+        if #list == 0 then
+            out[#out + 1] = { text = "    (none)", r = 0.6, g = 0.6, b = 0.6 }
+            return
+        end
+        local topV = (metric == "heal") and list[1].heal or list[1].dmg
+        if topV <= 0 then topV = 1 end
+        for i = 1, math.min(40, #list) do
+            local a = list[i]
+            local v = (metric == "heal") and a.heal or a.dmg
+            local pct = total > 0 and (v / total * 100) or 0
+            local r, g, b = rowColor(a.cls)
+            out[#out + 1] = {
+                text = string.format("%2d  %-16s %9s  %5.1f%%", i, Truncate(a.name, 16), abbr(v), pct),
+                r = r, g = g, b = b, barPct = v / topV,
+            }
+        end
+    end
+    if CONFIG.F_WHAT_DMG ~= false then section("dmg", "TOP DAMAGE") end
+    if CONFIG.F_WHAT_HEAL ~= false then
+        if CONFIG.F_WHAT_DMG ~= false then out[#out + 1] = { text = "", r = 0.4, g = 0.4, b = 0.4 } end
+        section("heal", "TOP HEALING")
+    end
+    if not hasTeam then
+        out[#out + 1] = { text = "", r = 0.4, g = 0.4, b = 0.4 }
+        out[#out + 1] = { text = "  Only you showing? Set the game's Damage/Heal Info to Raid (or higher) to include teammates.", r = 0.62, g = 0.62, b = 0.55 }
+    end
+    return out
 end
 
 local function RecordLogForTarget(unitID, unitName, text, r, g, b, meta)
@@ -955,6 +1742,13 @@ local function RecordLogForTarget(unitID, unitName, text, r, g, b, meta)
     local isSummary = meta and meta.logType == "summary"
     local histEntry = { text = text, r = r, g = g, b = b, time = ts }
     if meta then for k, v in pairs(meta) do histEntry[k] = v end end
+    -- Freeze the ancestral-variant icon. For YOUR own casts (source == you) it's your equipped
+    -- variant; for an INCOMING cast at you the caller pre-detects it from the debuff (meta.varIcon).
+    -- nil for everything else -> base. Frozen here so a later switch never re-skins this line.
+    local varIcon = (meta and meta.varIcon)
+                    or ((meta and meta.skill and meta.source == PLAYER_NAME and CONFIG._detectedVariant)
+                        and CONFIG._detectedVariant[meta.skill]) or nil
+    histEntry.varIcon = varIcon
     -- Summary lines go to session logs only — not the main live log or history stream
     if not isSummary then
         masterBuffer[#masterBuffer + 1] = histEntry
@@ -968,8 +1762,9 @@ local function RecordLogForTarget(unitID, unitName, text, r, g, b, meta)
         end
         if not (meta and meta.detailOnly) then
             local liveTxt = (meta and meta.liveText) or text
-            liveBuffer[#liveBuffer + 1] = { text = liveTxt, r = r, g = g, b = b, time = ts }
+            liveBuffer[#liveBuffer + 1] = { text = liveTxt, r = r, g = g, b = b, time = ts, skill = meta and meta.skill, dmgTag = meta and meta.dmgTag, varIcon = varIcon }
             liveBuffer = TrimBuffer(liveBuffer, 50)
+            CONFIG._liveSinceDiv = true  -- this fight put a line in the live feed -> divider warranted
             liveRebuildDirty = true
             local nowMs = api.Time:GetUiMsec()
             if nowMs - lastLiveRebuildTime >= 50 then
@@ -989,31 +1784,161 @@ end
 local function RecordHealLog(key, displayName, text, r, g, b, meta)
     if not text then return end
     local ts = GetTimestamp()
+    local isSummary = meta and meta.logType == "summary"
     -- History and session: store original unwrapped text
     local histEntry = { text = text, r = r, g = g, b = b, time = ts }
     if meta then for k, v in pairs(meta) do histEntry[k] = v end end
-    masterBuffer[#masterBuffer + 1] = histEntry
-    masterBuffer = TrimBuffer(masterBuffer, 1000)
-    if viewingMode == "LIVE" then
-        displayBuffer[#displayBuffer + 1] = histEntry
-        displayBuffer = TrimBuffer(displayBuffer, 1000)
-        local maxOffset = #displayBuffer - CONFIG.VISIBLE_ROWS_HIST
-        if logScrollOffset >= (maxOffset - 5) or logScrollOffset < 0 then logScrollOffset = maxOffset end
-        histDisplayDirty = true
+    local varIcon = (meta and meta.varIcon)
+                    or ((meta and meta.skill and meta.source == PLAYER_NAME and CONFIG._detectedVariant)
+                        and CONFIG._detectedVariant[meta.skill]) or nil  -- frozen variant icon
+    histEntry.varIcon = varIcon
+    -- End-of-fight summary lines (totals / Heal Stats / per-skill breakdowns) go to the per-fight
+    -- heal session ONLY -- not the live feed, master log, or LIVE history stream. The live feed is
+    -- real-time events only (matches RecordLogForTarget; tester feedback: totals aren't wanted live).
+    if not isSummary then
+        masterBuffer[#masterBuffer + 1] = histEntry
+        masterBuffer = TrimBuffer(masterBuffer, 1000)
+        if viewingMode == "LIVE" then
+            displayBuffer[#displayBuffer + 1] = histEntry
+            displayBuffer = TrimBuffer(displayBuffer, 1000)
+            local maxOffset = #displayBuffer - CONFIG.VISIBLE_ROWS_HIST
+            if logScrollOffset >= (maxOffset - 5) or logScrollOffset < 0 then logScrollOffset = maxOffset end
+            histDisplayDirty = true
+        end
     end
     if not healSessionByTarget[key] then
         healSessionByTarget[key] = { name = displayName, logs = {} }
     end
     table.insert(healSessionByTarget[key].logs, histEntry)
-    -- Live display: single line, SetEllipsis handles any overflow
-    liveBuffer[#liveBuffer + 1] = { text = text, r = r, g = g, b = b, time = ts }
-    liveBuffer = TrimBuffer(liveBuffer, 50)
-    liveRebuildDirty = true
-    local nowMs = api.Time:GetUiMsec()
-    if nowMs - lastLiveRebuildTime >= 50 then
-        lastLiveRebuildTime = nowMs
-        liveRebuildDirty = false
-        RebuildLiveLabels()
+    -- Live display: real-time heal events only (skip end-of-fight summary lines).
+    if not isSummary then
+        liveBuffer[#liveBuffer + 1] = { text = text, r = r, g = g, b = b, time = ts, skill = meta and meta.skill, varIcon = varIcon }
+        liveBuffer = TrimBuffer(liveBuffer, 50)
+        CONFIG._liveSinceDiv = true  -- live heal content this fight -> divider warranted
+        liveRebuildDirty = true
+        local nowMs = api.Time:GetUiMsec()
+        if nowMs - lastLiveRebuildTime >= 50 then
+            lastLiveRebuildTime = nowMs
+            liveRebuildDirty = false
+            RebuildLiveLabels()
+        end
+    end
+end
+
+-- Records one damage/heal event against a tracked party/raid ally into their recap
+-- timeline. Display/record only: does NOT touch combat state or other sessions.
+-- amount is the absolute value; isHeal distinguishes a heal (+) from damage (-).
+local RECAP_MAX_ENTRIES = 150
+local RECAP_MIN_DMG = 1000  -- skip an ally's recap session if they took less than this total damage (unless they died)
+local function RecordAllyRecap(sourceName, targetName, skill, amount, isHeal, isCrit, unitId)
+    -- Reset the per-heal overheal stash; set below once we have the target's HP. The
+    -- heal-done block reads CONFIG._healOverheal right after this call, same event.
+    if isHeal and sourceName == PLAYER_NAME then CONFIG._healOverheal = nil end
+    if amount <= 0 then return end
+    -- Refresh the roster at most every 3s here (instead of a per-frame timer in
+    -- OnLiveUpdate) to keep that function under Lua's 60-upvalue limit.
+    -- allyRosterTimer is reused as a "last refresh" timestamp; frameNow is per-frame.
+    if frameNow - allyRosterTimer > 3000 then
+        allyRosterTimer = frameNow
+        RefreshAllyRoster()
+    end
+    -- Floodgates: record EVERY unit's combat (ally, enemy or mob), from both sides.
+    local tag = GetAllyTag(targetName)   -- target's team tag (nil unless the target is a teammate)
+
+    -- HP% of the line's target. PRIMARY: read live HP straight off the target's id -- this works for
+    -- ANY unit (enemy, mob, boss), not just teammates/your target (proven via the COMBAT_TEXT probe).
+    local hpPct = nil
+    if unitId and unitId ~= "" and unitId ~= "0" then
+        local okI, info = pcall(function() return api.Unit:GetUnitInfoById(unitId) end)
+        if okI and type(info) == "table" then
+            local ch = tonumber(info.hp or info.health or info.current_health)
+            local mh = tonumber(info.max_health or info.max_hp or info.maxHealth)
+            if ch and mh and mh > 0 then
+                hpPct = math.floor(ch / mh * 100)
+                if hpPct < 0 then hpPct = 0 elseif hpPct > 100 then hpPct = 100 end
+            end
+        end
+    end
+    -- Team-tag / target-handle read: still needed for the player's overheal math (pre-heal HP of a
+    -- party member), and as the hpPct fallback if the id table lacks HP for this unit.
+    local okH, hp, okM, mhp = false, nil, false, nil
+    local hpHandle = tag or ((CONFIG._curTargetName and targetName == CONFIG._curTargetName) and "target" or nil)
+    if hpHandle then
+        okH, hp  = pcall(function() return api.Unit:UnitHealth(hpHandle) end)
+        okM, mhp = pcall(function() return api.Unit:UnitMaxHealth(hpHandle) end)
+        if okH and okM and hp and mhp and mhp > 0 and not hpPct then
+            hpPct = math.floor(hp / mhp * 100)
+            if hpPct < 0 then hpPct = 0 end
+        end
+    end
+
+    -- Overheal for the heal DISPLAY (always, not just under the capture toggle): the HP
+    -- read here is pre-heal (validated), so overheal = max(0, curhp + heal - maxHP).
+    -- Stashed on CONFIG for the heal-done block (no new upvalue in that tight handler).
+    if isHeal and sourceName == PLAYER_NAME and okH and okM and hp and mhp and mhp > 0 then
+        local over = (hp + amount) - mhp
+        if over < 0 then over = 0 end
+        CONFIG._healOverheal = { name = targetName, over = over }
+    end
+
+    -- Everything below is the Ally Recap timeline; skip when recap isn't enabled.
+    if not CONFIG.LOG_ALLY_RECAP then return end
+
+    local hpStr   = hpPct and string.format(" [%d%%]", hpPct) or ""
+    local critStr = isCrit and " (Crit)" or ""
+    local sign    = isHeal and "+" or "-"
+    local timeNow = GetTimestamp()
+
+    -- Append one line to ONE unit's recap. The line shows the WHOLE event ("Source -> Target") so it
+    -- reads correctly in the merged Overall/fight views; `ek` lets those views dedup the two records
+    -- (one under the source, one under the target) of the same event. `who` = the recap subject's
+    -- class (name icon + WHO filter). Direction lives in the arrow, so colour is just dmg vs heal.
+    local function addLine(recapName, who, srcName, tgtName, dealt, sw, tw)
+        local rec = recapData[recapName]
+        if not rec then rec = { name = recapName, logs = {}, dmgTaken = 0, died = false }; recapData[recapName] = rec end
+        rec.who = who
+        local r, g, b
+        if isHeal then r, g, b = 0.4, 1, 0.4 else r, g, b = 1, 0.55, 0.3 end
+        if (not dealt) and not isHeal then rec.dmgTaken = rec.dmgTaken + amount end
+        rec.keep = true   -- floodgates: keep any recap with content; the top toggles filter the view
+        rec.logs[#rec.logs + 1] = {
+            text = string.format("%s -> %s — %s %s%d%s%s", srcName, tgtName, skill, sign, amount, critStr, hpStr),
+            r = r, g = g, b = b, time = timeNow, hpPct = hpPct, dead = false,
+            isHeal = isHeal, dir = dealt and "dealt" or "taken",
+            sw = sw, tw = tw, what = isHeal and "heal" or "dmg",
+            ek = timeNow .. "|" .. srcName .. "|" .. tgtName .. "|" .. skill .. "|" .. amount,
+        }
+        if #rec.logs > RECAP_MAX_ENTRIES + 50 then
+            local trimmed = {}
+            for i = #rec.logs - RECAP_MAX_ENTRIES + 1, #rec.logs do trimmed[#trimmed + 1] = rec.logs[i] end
+            rec.logs = trimmed
+        end
+    end
+
+    -- Recaps capture OTHERS' combat only: anything involving you already lives in your own
+    -- Outgoing/Incoming/Heal sessions, so excluding you keeps each unit's "Overall" view free of
+    -- duplicates. Solo => no recap at all; group/raid/PvP => purely what other people did.
+    local youInvolved = (sourceName == PLAYER_NAME) or (targetName == PLAYER_NAME)
+    if not youInvolved
+       and sourceName ~= "Unknown" and sourceName ~= ""
+       and targetName ~= "Unknown" and targetName ~= "" then
+        -- Spectator mode: each nearby combat event keeps the bracketed fight alive.
+        if CONFIG.SPECTATE then timeSinceLastAction = 0 end
+        -- classify both ends once (target has an id => reliable; source leans on the cache). sw/tw
+        -- describe the EVENT, so both lines carry the same pair; `dir` distinguishes the perspective.
+        local srcClass = CONFIG._classifyUnit(sourceName, nil)
+        local tgtClass = CONFIG._classifyUnit(targetName, unitId)
+        -- capture toggles: skip a subject whose class isn't being recorded.
+        local recOK = { ally = CONFIG.REC_ALLY ~= false, enemy = CONFIG.REC_ENEMY ~= false, mob = CONFIG.REC_MOB ~= false }
+        -- Both records describe the same event (sourceName -> targetName); merged views dedup by ek.
+        -- recorded under the TARGET (their incoming)
+        if recOK[tgtClass] then addLine(targetName, tgtClass, sourceName, targetName, false, srcClass, tgtClass) end
+        -- recorded under the SOURCE (their outgoing). Skip self-procs AND effect-ticks: a HoT/DoT
+        -- reports the EFFECT name as the source (source == skill, e.g. "Rhythmic Renewal"), which is
+        -- not a real unit -- recording it would make the spell show up as its own contributor.
+        if sourceName ~= targetName and sourceName ~= skill and recOK[srcClass] then
+            addLine(sourceName, srcClass, sourceName, targetName, true, srcClass, tgtClass)
+        end
     end
 end
 
@@ -1026,51 +1951,509 @@ local function ScrollLogDown()
     local totalLines = #displayBuffer; local maxOffset = totalLines - CONFIG.VISIBLE_ROWS_HIST; if maxOffset < 0 then maxOffset = 0 end
     logScrollOffset = logScrollOffset + 5; if logScrollOffset > maxOffset then logScrollOffset = maxOffset end; UpdateHistoryDisplay() 
 end
-local function UpdateSessionList()
-    if lblSessionCount then lblSessionCount:SetText("Saved: " .. #allSessions) end
-    if not wHistory:IsVisible() then return end
-    local totalSessions = #allSessions
-    local maxScroll = totalSessions - CONFIG.SESSIONS_VISIBLE
+-- Grouped session list: one entry per name, each holding all that name's sessions
+-- (Heal/Recap/In/Out) concatenated under per-session headers. Rebuilt only when
+-- allSessions changes (not on scroll).
+local sessionGroups = {}   -- ordered array of { name, sessions = {..}, count, latest }
+local sessionFilter = ""    -- name filter from the history search box ("" = show all)
+local sidebarMode  = "NAMES" -- "NAMES" (list of names) or "SESSIONS" (one name's sessions)
+local selectedGroup = nil    -- the group drilled into while in SESSIONS mode
+local selectedContributor = nil  -- Level 3: a multi-instance contributor drilled into (its same-named units)
+local sidebarBackBtn = nil    -- back button widget (shown only in SESSIONS mode)
+
+local function RebuildSessionGroups()
+    -- Group sessions by FIGHT (fightId). One group per fight, plus a synthetic "Overall" group
+    -- spanning every fight, pinned at the top. Each group keeps its session entries so
+    -- CONFIG._buildOverall can stream them. (Per-name browsing now lives inside a fight's
+    -- contributor bar, not the sidebar.)
+    local byFight = {}
+    local order = {}
+    local overall = { name = "Overall", isOverall = true, sessions = {}, count = 0, latest = 0 }
+    for i = 1, #allSessions do
+        local s = allSessions[i]
+        local fid = s.fightId or 0
+        local grp = byFight[fid]
+        if not grp then
+            grp = { fightId = fid, isFight = true, time = s.time or "", sessions = {}, count = 0, latest = i }
+            byFight[fid] = grp
+            order[#order + 1] = grp
+        end
+        local typeLabel = s.isHeal and "Heal"
+                       or (s.isRecap and "Recap"
+                       or (s.isIncoming and "Incoming" or "Outgoing"))
+        local scat
+        if s.isHeal then scat = s.isHealDone and "myHeal" or "healRcv"
+        elseif s.isRecap then scat = "oth"
+        elseif s.isIncoming then scat = "inc"
+        else scat = "myDmg" end
+        local entry = { time = s.time or "", typeLabel = typeLabel, scat = scat, who = s.who,
+                        name = s.targetName, targetId = s.targetId, logs = s.logs,
+                        endedInDeath = s.endedInDeath, endedInKill = s.endedInKill }
+        grp.sessions[#grp.sessions + 1] = entry
+        overall.sessions[#overall.sessions + 1] = entry
+        grp.count = grp.count + 1
+        grp.latest = i
+        if s.endedInDeath then grp.hasDeath = true; overall.hasDeath = true end
+        if s.endedInKill then grp.hasKill = true; overall.hasKill = true end
+        -- Sidebar fight categorisation: PvE = any mob opponent, PvP = any enemy player (s.who was
+        -- classified WITH the unit id at save time; fall back to a name classify). Duel propagated from
+        -- the record. deathCount = distinct units that died (deduped by name).
+        local oc = s.who or CONFIG._classifyUnit(s.targetName, nil)
+        if oc == "mob" then grp.hasPvE = true elseif oc == "enemy" then grp.hasPvP = true end
+        if s.wasDuel then grp.wasDuel = true end
+        if s.endedInDeath or s.endedInKill then
+            -- count DISTINCT dead units: by unit id when we have it (so 3 same-named kills read 3),
+            -- else by name (others'-combat recaps are name-merged).
+            local dk = s.targetId or s.targetName
+            if dk then
+                grp.deaths = grp.deaths or {}
+                if not grp.deaths[dk] then grp.deaths[dk] = true; grp.deathCount = (grp.deathCount or 0) + 1 end
+            end
+        end
+    end
+    table.sort(order, function(a, b) return a.latest > b.latest end)  -- newest fight first
+    overall.count = #order                                            -- number of fights
+    for _, g in ipairs(order) do                                      -- attach fight duration from the meter snapshot
+        local fm = CONFIG._fightMeters and CONFIG._fightMeters[g.fightId]
+        if fm then g.durSec = fm.durSec end
+    end
+    table.insert(order, 1, overall)                                   -- Overall pinned on top
+    sessionGroups = order
+    -- Preserve a drilled-in selection across rebuilds: a new fight saving mid-browse must NOT kick
+    -- you back to the fight list. Re-point selectedGroup to the equivalent freshly-built group.
+    if selectedGroup then
+        local wantOverall, wantFid = selectedGroup.isOverall, selectedGroup.fightId
+        local found = nil
+        for _, g in ipairs(order) do
+            if (wantOverall and g.isOverall) or (not wantOverall and wantFid and g.fightId == wantFid) then found = g; break end
+        end
+        selectedGroup = found
+        if not found then sidebarMode = "NAMES"; selectedContributor = nil end   -- the viewed fight was trimmed away
+    else
+        sidebarMode = "NAMES"
+    end
+end
+
+-- Three-axis filter helpers (WHO x WHAT x DIR). A line is visible when its WHAT is enabled AND
+-- either its source side (source class + Dealt) or its target side (target class + Taken) is on.
+-- sw/tw are unit classes: "me"/"ally"/"enemy"/"mob". Player sessions are uniform, so they filter
+-- as a whole via _sessionVisible (which keeps their summary block tied to the same decision).
+CONFIG._whoOn = function(w)
+    if w == "me"    then return CONFIG.F_WHO_ME    ~= false end
+    if w == "ally"  then return CONFIG.F_WHO_ALLY  ~= false end
+    if w == "enemy" then return CONFIG.F_WHO_ENEMY ~= false end
+    if w == "mob"   then return CONFIG.F_WHO_MOB   ~= false end
+    return true
+end
+CONFIG._lineVisible = function(sw, tw, what)
+    if what == "heal" then if CONFIG.F_WHAT_HEAL == false then return false end
+    elseif CONFIG.F_WHAT_DMG == false then return false end
+    local dealt = (CONFIG.F_DIR_DEALT ~= false) and CONFIG._whoOn(sw)
+    local taken = (CONFIG.F_DIR_TAKEN ~= false) and CONFIG._whoOn(tw)
+    return dealt or taken
+end
+CONFIG._sessionVisible = function(s)
+    -- Your OWN sessions are gated on "Me": with Me off, none of your combat shows -- even though the
+    -- opponent's side would otherwise match (your hit on a mob IS "the mob took damage"). WHAT and
+    -- your direction (you dealt vs. you took) still apply on top of that.
+    if CONFIG.F_WHO_ME == false then return false end
+    local heal = (s.scat == "myHeal" or s.scat == "healRcv")
+    if heal then if CONFIG.F_WHAT_HEAL == false then return false end
+    elseif CONFIG.F_WHAT_DMG == false then return false end
+    local youDealt = (s.scat == "myDmg" or s.scat == "myHeal")  -- you are the actor
+    if youDealt then return CONFIG.F_DIR_DEALT ~= false else return CONFIG.F_DIR_TAKEN ~= false end
+end
+
+-- Build a group's combined stream, honouring the three-axis filter. Player sessions are kept or
+-- dropped whole (lines + their summary); recap "oth" sessions keep only the lines that pass the
+-- per-line WHO/WHAT/DIR test. Stored on CONFIG. The caller runs it through ExpandArchive.
+CONFIG._buildOverall = function(grp)
+    local out, seen = {}, {}
+    for _, s in ipairs((grp and grp.sessions) or {}) do
+        local ct = tostring(s.time or ""):gsub("[%[%]]", ""):gsub("^%s+", ""):gsub("%s+$", "")
+        local dk = s.endedInDeath and " [DIED]" or (s.endedInKill and " [KILL]" or "")
+        local header = { text = "=====  " .. (s.typeLabel or "?") .. "  " .. ct .. dk .. "  =====", r = 0.55, g = 0.7, b = 1 }
+        if s.scat == "oth" then
+            -- Recap (others-only): keep lines that pass WHO/WHAT/DIR, deduped by event (the same hit
+            -- is recorded under both the source's and the target's recap).
+            local kept = {}
+            for _, ln in ipairs(s.logs or {}) do
+                local what = ln.what or (ln.isHeal and "heal" or "dmg")
+                if CONFIG._lineVisible(ln.sw, ln.tw, what) and not (ln.ek and seen[ln.ek]) then
+                    if ln.ek then seen[ln.ek] = true end
+                    kept[#kept + 1] = ln
+                end
+            end
+            if #kept > 0 then
+                out[#out + 1] = header
+                for _, ln in ipairs(kept) do out[#out + 1] = ln end
+            end
+        elseif CONFIG._sessionVisible(s) then
+            -- Player session: kept whole, so its summary block follows the same decision.
+            out[#out + 1] = header
+            for _, ln in ipairs(s.logs or {}) do out[#out + 1] = ln end
+        end
+    end
+    return out
+end
+
+-- A single unit's view: one chronological timeline (all its lines, filtered, merged + sorted by
+-- time), a "*** DIED ***" marker per fight in which it died (deduped by fight time), and its
+-- summary block(s) collected at the bottom. Used for contributor drill-downs.
+CONFIG._unitTimeline = function(grp)
+    local items, summary, deathAt, seen = {}, {}, {}, {}
+    for _, s in ipairs((grp and grp.sessions) or {}) do
+        if s.scat == "oth" then
+            for _, ln in ipairs(s.logs or {}) do
+                local what = ln.what or (ln.isHeal and "heal" or "dmg")
+                if CONFIG._lineVisible(ln.sw, ln.tw, what) and not (ln.ek and seen[ln.ek]) then
+                    if ln.ek then seen[ln.ek] = true end
+                    items[#items + 1] = ln
+                end
+            end
+        elseif CONFIG._sessionVisible(s) then
+            for _, ln in ipairs(s.logs or {}) do
+                if ln.logType == "summary" then summary[#summary + 1] = ln else items[#items + 1] = ln end
+            end
+        end
+        -- Death markers. A unit's death (recap endedInDeath, or you got the kill) is deduped per
+        -- fight+name so multi-unit fights still show each death; your own death is deduped per fight.
+        local nm = s.name or "?"
+        local dt = s.time or "~~"
+        if ((s.scat == "oth" and s.endedInDeath) or (s.scat ~= "oth" and s.endedInKill)) and not deathAt[dt .. "|" .. nm] then
+            deathAt[dt .. "|" .. nm] = true
+            items[#items + 1] = { text = "      *** " .. nm .. " DIED ***", r = 1, g = 0.35, b = 0.35, time = dt }
+        end
+        if s.scat ~= "oth" and s.endedInDeath and not deathAt["you|" .. dt] then
+            deathAt["you|" .. dt] = true
+            items[#items + 1] = { text = "      *** YOU DIED ***", r = 1, g = 0.3, b = 0.3, time = dt }
+        end
+    end
+    -- STABLE sort. Timestamps are 1-second strings and Lua's table.sort is unstable, so same-second
+    -- lines -- a skill header, its damage/heal detail, and its mitigation breakdown (all logged under
+    -- one key, in order) -- were getting scrambled in the archive while the live log (which never
+    -- sorts) stayed correct. Tag each item with its collection order and tiebreak on it so the
+    -- archive replays the exact logged order.
+    for idx = 1, #items do items[idx]._si = idx end
+    table.sort(items, function(a, b)
+        local ta, tb = tostring(a.time or ""), tostring(b.time or "")
+        if ta ~= tb then return ta < tb end
+        return (a._si or 0) < (b._si or 0)
+    end)
+    -- Contributor view: if this unit's gear score was cached (from a time you targeted them), pin it
+    -- at the top. Only players ever have one (mobs read 0 and are never stored).
+    if grp and grp.isContributor and grp.name and CONFIG._nameGS then
+        local gs = CONFIG._nameGS[string.lower(grp.name)]
+        if gs then table.insert(items, 1, { text = "  Gear Score: " .. gs, r = 0.85, g = 0.8, b = 0.45 }) end
+    end
+    if #summary > 0 then
+        items[#items + 1] = { text = "=====  Summary  =====", r = 0.55, g = 0.7, b = 1 }
+        for _, ln in ipairs(summary) do items[#items + 1] = ln end
+    end
+    return items
+end
+
+-- Every scope (Overall / fight / contributor) renders as one merged, deduped, chronological
+-- timeline of "Source -> Target" lines.
+CONFIG._buildView = function(grp)
+    if grp and grp.isMeter and CONFIG._fightMeters and CONFIG._fightMeters[grp.fightId] then
+        return CONFIG._buildMeterView(grp.fightId, grp.meterScope)
+    end
+    return CONFIG._unitTimeline(grp)
+end
+
+-- Distinct contributors (units) in a group, each returned as a mini-group with its own sessions,
+-- for the Level-2 sidebar drill. ResolveNameKey reads .who for the icon; .hasDeath flags a death.
+CONFIG._contributorsOf = function(group)
+    local byName, order, me = {}, {}, nil
+    for _, s in ipairs((group and group.sessions) or {}) do
+        local nm = s.name or "?"
+        local c = byName[nm]
+        if not c then c = { name = nm, sessions = {}, who = s.who, count = 0, isContributor = true }; byName[nm] = c; order[#order + 1] = c end
+        c.sessions[#c.sessions + 1] = s
+        c.count = c.count + 1
+        if s.targetId then c._ids = c._ids or {}; c._ids[s.targetId] = true end  -- distinct unit instances
+        if s.who then c.who = s.who end
+        -- A unit "died" if its recap ended in death (ally/enemy) OR you killed it (mob -> endedInKill).
+        if s.endedInDeath or s.endedInKill then c.hasDeath = true end
+        -- YOUR own combat (any non-recap session: scat ~= "oth") ALSO rolls up under a synthetic
+        -- "Me" contributor, pinned first -- so you can click yourself, while still appearing under
+        -- each opponent too. (Grouped sessions carry `scat`, not `isRecap`.)
+        if s.scat ~= "oth" then
+            if not me then me = { name = PLAYER_NAME, sessions = {}, who = "ally", count = 0, isContributor = true, isMe = true } end
+            me.sessions[#me.sessions + 1] = s
+            me.count = me.count + 1
+            if s.endedInDeath then me.hasDeath = true end
+        end
+    end
+    if me then table.insert(order, 1, me) end   -- pin "Me" at the top of the contributor list
+    -- Raid Meter: surface the fight's raid leaderboard as one clickable pseudo-contributor that
+    -- rides the existing view rails; the Damage/Healing filter picks which sections (dmg/heal) show.
+    if CONFIG.RAID_METER and group and group.fightId and CONFIG._fightMeters and CONFIG._fightMeters[group.fightId] then
+        table.insert(order, 1, { name = "Raid Meter", who = "ally", sessions = {}, isContributor = true, isMeter = true, meterScope = "raid", fightId = group.fightId })
+    end
+    -- Mark contributors that are several same-named units (distinct ids) so they drill to Level 3.
+    for _, c in ipairs(order) do
+        if c._ids then
+            local n = 0; for _ in pairs(c._ids) do n = n + 1 end
+            if n > 1 then c.multiInstance = true; c.instanceCount = n end
+        end
+    end
+    return order
+end
+
+-- Same-named units (instances) inside one contributor, split by unit id, for the Level-3 drill.
+-- Each instance = that one mob (your combat with it + per-id kill), numbered by order of appearance.
+-- Sessions without a targetId (others'-combat recaps, which are name-merged) are skipped -- the
+-- per-instance split only covers your OWN combat with each unit.
+CONFIG._instancesOf = function(c)
+    local byId, order = {}, {}
+    for _, s in ipairs((c and c.sessions) or {}) do
+        if s.targetId then
+            local inst = byId[s.targetId]
+            if not inst then
+                inst = { name = c.name, sessions = {}, who = c.who, count = 0, isContributor = true, isInstance = true, targetId = s.targetId }
+                byId[s.targetId] = inst; order[#order + 1] = inst
+            end
+            inst.sessions[#inst.sessions + 1] = s
+            inst.count = inst.count + 1
+            if s.endedInDeath or s.endedInKill then inst.hasDeath = true end
+        end
+    end
+    for i, inst in ipairs(order) do inst.name = c.name .. " #" .. i end
+    return order
+end
+
+-- Size + position the session-list scrollbar thumb (mirrors UpdateScrollThumb for the sidebar).
+-- The sidebar is HIST_HEIGHT-58 tall; its up/down arrows (40px + margins/gaps) leave HIST_HEIGHT-256
+-- for the track. Called from UpdateSessionList with the current total + visible counts.
+local function UpdateSessionThumb(total, vis)
+    if not sessTrack or not sessThumb then return end
+    local trackH = CONFIG.HIST_HEIGHT - 256
+    if (total or 0) <= (vis or 0) or trackH <= 24 then
+        sessThumb:Show(false)
+        CONFIG._sessRange, CONFIG._sessMaxScroll = 0, 0
+        return
+    end
+    sessThumb:Show(true)
+    local thumbH = math.max(24, math.floor(trackH * vis / total))
+    if thumbH > trackH then thumbH = trackH end
+    local range     = trackH - thumbH
+    local maxScroll = total - vis
+    local y = (maxScroll > 0) and math.floor((sessionScrollOffset / maxScroll) * range + 0.5) or 0
+    if y < 0 then y = 0 elseif y > range then y = range end
+    sessThumb:SetExtent(8, thumbH)
+    sessThumb:RemoveAllAnchors()
+    sessThumb:AddAnchor("TOP", sessTrack, 0, y)
+    CONFIG._sessRange, CONFIG._sessMaxScroll = range, maxScroll
+end
+
+local function UpdateSessionList(rebuild)
+    if rebuild then RebuildSessionGroups() end
+    if not wHistory:IsVisible() then
+        if lblSessionCount then lblSessionCount:SetText("Saved: " .. #allSessions) end
+        return
+    end
+
+    -- Two levels:
+    --   Level 1 (FIGHTS): Overall + one row per fight. Clicking a row DRILLS in.
+    --   Level 2 (CONTRIBUTORS): the drilled group's Overall (pinned) + its units. Clicking VIEWS.
+    local level2 = (sidebarMode == "SESSIONS" and selectedGroup) and true or false
+    local level3 = (level2 and selectedContributor) and true or false
+    local entries
+    if level3 then
+        entries = CONFIG._instancesOf(selectedContributor)
+        if sidebarBackBtn then sidebarBackBtn:Show(true) end
+        if lblSessionCount then lblSessionCount:SetText(Truncate(selectedContributor.name, 24) .. "  (" .. #entries .. ")") end
+    elseif level2 then
+        entries = CONFIG._contributorsOf(selectedGroup)
+        if sessionFilter ~= "" then   -- name search: keep only contributors whose name matches
+            local f = string.lower(sessionFilter)
+            local filtered = {}
+            for _, e in ipairs(entries) do
+                if e.name and string.find(string.lower(e.name), f, 1, true) then filtered[#filtered + 1] = e end
+            end
+            entries = filtered
+        end
+        if sidebarBackBtn then sidebarBackBtn:Show(true) end
+        if lblSessionCount then
+            if sessionFilter ~= "" then
+                lblSessionCount:SetText('Search: "' .. sessionFilter .. '"  (' .. #entries .. ')')
+            else
+                local t = tostring(selectedGroup.time or ""):gsub("[%[%]]", ""):gsub("^%s+", ""):gsub("%s+$", "")
+                lblSessionCount:SetText(selectedGroup.isOverall and "Overall" or ("Fight " .. t))
+            end
+        end
+    else
+        entries = sessionGroups
+        if sessionFilter ~= "" then  -- name search: keep Overall + fights that include a matching unit
+            local f = string.lower(sessionFilter)
+            entries = {}
+            for _, g in ipairs(sessionGroups) do
+                local keep = g.isOverall
+                if not keep then
+                    for _, s in ipairs(g.sessions) do
+                        if s.name and string.find(string.lower(s.name), f, 1, true) then keep = true; break end
+                    end
+                end
+                if keep then entries[#entries + 1] = g end
+            end
+        end
+        if sidebarBackBtn then sidebarBackBtn:Show(false) end
+        if lblSessionCount then lblSessionCount:SetText("Saved: " .. #allSessions) end
+    end
+
+    local reserve = (level2 and sessionFilter == "") and 1 or 0   -- pin the scope's Overall (but not while name-searching)
+    local vis = CONFIG.SESSIONS_VISIBLE - reserve
+    local total = #entries
+    local maxScroll = total - vis
     if maxScroll < 0 then maxScroll = 0 end
     if sessionScrollOffset > maxScroll then sessionScrollOffset = maxScroll end
     if sessionScrollOffset < 0 then sessionScrollOffset = 0 end
-    local startIdx = totalSessions - CONFIG.SESSIONS_VISIBLE - sessionScrollOffset + 1
-    if startIdx < 1 then startIdx = 1 end
-    local btnIdx = 1
-    for i = startIdx, startIdx + CONFIG.SESSIONS_VISIBLE - 1 do
-        local session = allSessions[i]
+    UpdateSessionThumb(total, vis)
+    local startIdx = 1 + sessionScrollOffset   -- top-anchored
+
+    if reserve == 1 then
+        local ob = sessionButtons[1]
+        if ob then
+            if ob.clpIcon then ob.clpIcon:Show(false) end
+            if ob.clpMarkIcon then ob.clpMarkIcon:Show(false) end
+            ob.clpIconKey = nil; ob.clpMarkKey = nil
+            if ob.clpSkill then for j = 1, 3 do if ob.clpSkill[j] then ob.clpSkill[j]:SetVisible(false) end end end
+            if ob.durLabel then ob.durLabel:Show(false) end
+            if ob.timeLabel then ob.timeLabel:Show(false) end
+            if ob.deathLabel then ob.deathLabel:Show(false) end
+            local pinned = (level3 and selectedContributor) or selectedGroup
+            if level3 then ob:SetText("  " .. Truncate(selectedContributor.name, 18) .. "  (all)")
+            else ob:SetText("  Overall  (" .. #selectedGroup.sessions .. ")") end
+            if pinned.hasDeath then ob:SetTextColor(1, 0.5, 0.4, 1) else ob:SetTextColor(1, 0.85, 0.3, 1) end
+            ob.drillGroup = nil; ob.viewGroup = pinned; ob.drillContributor = nil
+            ob:Show(true); ob:Raise()
+        end
+    end
+
+    local btnIdx = 1 + reserve
+    for i = startIdx, startIdx + vis - 1 do
+        local e = entries[i]
         local btn = sessionButtons[btnIdx]
         if btn then
-            if session then
-                local prefix, r, g, b
-                if session.isHeal then
-                    prefix = "[Heal] "
-                    r, g, b = 0, 1, 0
-                elseif session.isIncoming then
-                    prefix = "[In] "
-                    r, g, b = 1, 0.3, 0.3
+            if e then
+                btn.clpIconKey = nil; btn.clpMarkKey = nil; btn.drillContributor = nil
+                if btn.clpMarkIcon then btn.clpMarkIcon:Show(false) end
+                if btn.clpSkill then for j = 1, 3 do if btn.clpSkill[j] then btn.clpSkill[j]:SetVisible(false) end end end
+                if btn.durLabel then btn.durLabel:Show(false) end
+                if btn.timeLabel then btn.timeLabel:Show(false) end
+                if btn.deathLabel then btn.deathLabel:Show(false) end
+                if level2 then
+                    -- contributor row: unit name + role/class icon; clicking VIEWS that unit's combat
+                    -- Contributor rows no longer show the left unit-type icon -- the generic
+                    -- player/mount/mob glyphs were clutter and can't resolve real class/role for
+                    -- most units post-lockdown anyway. The death/bloodlust marker (right) stays.
+                    btn.clpIconKey = nil
+                    if btn.clpIcon then btn.clpIcon:Show(false) end
+                    -- 180px button: ~22 chars fit; leave room for the skull (~26px) on death rows.
+                    btn:SetText(Truncate(e.name, e.multiInstance and 13 or (e.hasDeath and 18 or 22)) .. (e.multiInstance and ("  \195\151" .. e.instanceCount) or ""))
+                    if btn.style then btn.style:SetAlign(ALIGN.CENTER) end   -- contributor names centered
+                    -- Name colour by faction / PvP status (the skull marks death, so no death-red).
+                    -- Pirate (faction name) and bloodlust (forced-PvP) are only known for units you've
+                    -- targeted (cached); opposite-faction (enemy player) is known by id for everyone.
+                    do
+                        -- RELATIVE AA nameplate colours (palette from "Old Colors" by Shinimi). byid
+                        -- friendly/hostile is already relative to YOU (a pirate's own pirates read
+                        -- friendly), so we key off it. Priority: you > party/raid > bloodlust >
+                        -- same-side > hostile(pink/red by bloc) > mob.
+                        local fln   = string.lower(e.name or "")
+                        local fac   = CONFIG._nameFaction and CONFIG._nameFaction[fln]   -- faction NAME (target-cached)
+                        local force = CONFIG._nameForce and CONFIG._nameForce[fln]       -- bloodlust/criminal (target-cached)
+                        local team  = GetAllyTag(e.name) ~= nil                          -- party/raid member
+                        local cr, cg, cb
+                        if e.isMe then                cr, cg, cb = 0.451, 0.824, 0.200    -- you        #73D233
+                        elseif team then              cr, cg, cb = 0.310, 0.800, 0.922    -- party/raid #4FCCEB (stays ally even if bloodlusted)
+                        elseif force then             cr, cg, cb = 0.604, 0.451, 0.835    -- bloodlust  #9A73D5 (incl your own faction)
+                        elseif e.who == "ally" then   cr, cg, cb = 0.451, 0.824, 0.200    -- same side  #73D233 (friendly faction, non-party)
+                        elseif e.who == "enemy" then  cr, cg, cb = CONFIG._enemyColor(fac) -- pink/red by the bloc model
+                        else                          cr, cg, cb = 0.584, 0.584, 0.584 end -- mob/NPC    #959595
+                        btn:SetTextColor(cr, cg, cb, 1)
+                    end
+                    if e.hasDeath and btn.clpMarkIcon then
+                        btn.clpMarkKey = "__death__"
+                        ClpSetIcon(btn.clpMarkIcon, CONFIG._ovIcon("__death__"))
+                        btn.clpMarkIcon:Show(true)   -- raised AFTER the button (below) so it isn't covered
+                    elseif btn.clpMarkIcon and CONFIG._nameForce and CONFIG._nameForce[string.lower(e.name or "")] then
+                        btn.clpMarkKey = "__bloodlust__"   -- bloodlusted/criminal marker (skull's sibling)
+                        ClpSetIcon(btn.clpMarkIcon, CONFIG._ovIcon("__bloodlust__"))
+                        btn.clpMarkIcon:Show(true)
+                    end
+                    if e.multiInstance then btn.drillGroup = nil; btn.viewGroup = nil; btn.drillContributor = e   -- DRILL to Level 3
+                    else btn.drillGroup = nil; btn.viewGroup = e; btn.drillContributor = nil end
                 else
-                    prefix = "[Out] "
-                    r, g, b = 0, 1, 1
+                    -- Level 1: Overall or Fight row; clicking DRILLS in
+                    if btn.clpIcon then btn.clpIcon:Show(false) end; btn.clpIconKey = nil
+                    local died = (not e.isOverall) and (e.hasDeath or e.hasKill)
+                    local label, cr, cg, cb
+                    if e.isOverall then
+                        label = "Overall  (" .. (e.count or 0) .. " fights)"; cr, cg, cb = 1, 0.85, 0.3
+                    else
+                        -- Fight row: bright duration (left) + faint time (right) + death count anchored
+                        -- to the skull ("N [skull]" = N deaths). The button's own text is empty; the
+                        -- three sub-labels carry it (one label can't be part-bright/part-faint).
+                        label = ""
+                        if died then cr, cg, cb = 1, 0.4, 0.4 else cr, cg, cb = 0.7, 0.78, 0.9 end
+                        local secs = math.floor(e.durSec or 0)
+                        local durStr = e.durSec and ((secs >= 60) and string.format("%dm%02ds", math.floor(secs / 60), secs % 60) or (secs .. "s")) or ""
+                        local t = tostring(e.time):gsub("[%[%]]", ""):gsub("^%s+", ""):gsub("%s+$", ""):gsub(":%d%d$", "")  -- HH:MM
+                        if btn.durLabel then
+                            btn.durLabel:SetText(durStr)
+                            if btn.durLabel.style then btn.durLabel.style:SetColor(cr, cg, cb, 1) end
+                            btn.durLabel:Show(true)
+                        end
+                        if btn.timeLabel then btn.timeLabel:SetText(t); btn.timeLabel:Show(true) end
+                        if btn.deathLabel and (e.deathCount or 0) > 0 then
+                            btn.deathLabel:SetText(tostring(e.deathCount))
+                            if btn.deathLabel.style then btn.deathLabel.style:SetColor(cr, cg, cb, 1) end
+                            btn.deathLabel:Show(true)
+                        end
+                        -- Category icon (pickable display): duel > pvp > pve.
+                        local cat = e.wasDuel and "duel" or (e.hasPvP and "pvp" or (e.hasPvE and "pve" or nil))
+                        if cat and btn.clpIcon then
+                            if cat == "duel" then CONFIG._resolveDuelIcon() end  -- use the real Duel buff icon
+                            btn.clpIconKey = "__" .. cat .. "__"
+                            ClpSetIcon(btn.clpIcon, CONFIG._ovIcon("__" .. cat .. "__"))
+                            btn.clpIcon:Show(true)
+                        end
+                    end
+                    if btn.style then btn.style:SetAlign(ALIGN.CENTER) end
+                    btn:SetText(label)
+                    btn:SetTextColor(cr, cg, cb, 1)
+                    btn.drillGroup = e; btn.viewGroup = nil
+                    if died and btn.clpMarkIcon then
+                        btn.clpMarkKey = "__death__"
+                        ClpSetIcon(btn.clpMarkIcon, CONFIG._ovIcon("__death__"))
+                        btn.clpMarkIcon:Show(true)   -- raised AFTER the button (below) so it isn't covered
+                    end
                 end
-                local shortName = Truncate(session.targetName, 14)
-                local stat = session.totalDmg or session.totalHeal or 0
-                if stat > 0 then shortName = shortName .. " (" .. stat .. ")" end
-                btn:SetText(string.format("#%d %s%s", i, prefix, shortName))
-                btn:SetTextColor(r, g, b, 1); btn:Show(true); btn:Raise(); btn.sessionIndex = i
-            else btn:Show(false) end
+                btn:Show(true); btn:Raise()
+                if btn.clpIcon then btn.clpIcon:Raise() end
+                if btn.clpMarkIcon and btn.clpMarkKey then btn.clpMarkIcon:Raise() end  -- on top of the button
+            else
+                btn:Show(false)
+                if btn.clpIcon then btn.clpIcon:Show(false) end
+                if btn.clpMarkIcon then btn.clpMarkIcon:Show(false) end
+            end
         end
         btnIdx = btnIdx + 1
     end
 end
-local function ScrollSession(delta) if delta > 0 then sessionScrollOffset = sessionScrollOffset + 1 else sessionScrollOffset = sessionScrollOffset - 1 end; UpdateSessionList() end
+-- Top-anchored list (Overall first): up/wheel-up decrease the offset toward the top.
+local function ScrollSession(delta) if delta > 0 then sessionScrollOffset = sessionScrollOffset - 1 else sessionScrollOffset = sessionScrollOffset + 1 end; UpdateSessionList() end
 local function ClearAll()
     liveBuffer = {}; masterBuffer = {}; displayBuffer = {}; allSessions = {}
-    currentSessionLogs = {}; sessionByTarget = {}; healSessionByTarget = {}
-    fightData = { outgoing = {}, incoming = {} }; healData = { done = {}, received = {} }
+    currentSessionLogs = {}; sessionByTarget = {}; healSessionByTarget = {}; recapData = {}
+    fightData = { outgoing = {}, incoming = {} }; healData = { done = {}, received = {} }; CONFIG._shieldAbsorb = nil; CONFIG._fightWasDuel = nil
+    if CONFIG._meterReset then CONFIG._meterReset() end
     activeDots = {}; activeCCSessions = {}; sessionScrollOffset = 0; logScrollOffset = 0
     for i = 1, #liveLabels do liveLabels[i]:SetText("") end
-    UpdateHistoryDisplay(); UpdateSessionList(); LogEntry("--- History Cleared ---", 1, 1, 0)
+    UpdateHistoryDisplay(); UpdateSessionList(true); LogEntry("--- History Cleared ---", 1, 1, 0)
 end
 
 -- ============================================================================
@@ -1149,36 +2532,34 @@ local function GetPlayerBuffStacks(buffName)
     return playerBuffStackCache[buffName] or 0
 end
 
+-- Updates the live-window status badge (kept separate from the static title).
+-- Routed through one helper so the big handlers swap a reference instead of
+-- each gaining a liveTitleLabel/liveStatusLabel upvalue.
+local function SetCombatStatus(inCombatNow)
+    local sl = liveTitleLabel and liveTitleLabel.statusLabel
+    if not sl then return end
+    if inCombatNow then
+        sl:SetText("IN COMBAT")
+        if sl.style then sl.style:SetColor(1, 0.35, 0.35, 1) end
+    else
+        sl:SetText("IDLE")
+        if sl.style then sl.style:SetColor(0.45, 0.45, 0.45, 1) end
+    end
+end
+
 local function FinishFight()
     if not inCombat then return end
     inCombat = false
-    -- Flush any buffered event log lines to file
-    if CONFIG.DEBUG_LOG_EVENTS and #eventLogLines > 0 then
-        local existing = api.File:Read(eventLogFile) or {}
-        if type(existing) ~= "table" then existing = {} end
-        for _, line in ipairs(eventLogLines) do table.insert(existing, line) end
-        pcall(function() api.File:Write(eventLogFile, existing) end)
-        eventLogLines = {}
-    end
-    liveTitleLabel:SetText("Combat Log [Idle]")
-    if liveTitleLabel.style then liveTitleLabel.style:SetColor(0.7, 0.7, 0.7, 1) end
+    CONFIG._gameInCombat = false  -- clear in case we closed via the safety net
+    CONFIG._diedThisFight = CONFIG._playerDied  -- snapshot before reset; tags this fight's saved sessions
+    CONFIG._playerDied = false; CONFIG._targetDeadLogged = false  -- reset death markers for next fight
+    CONFIG._lastDmgSrc = nil; CONFIG._deathLogged = nil           -- reset killer-attribution + dedup
+    CONFIG._killGrace = nil                                       -- reset deferred-kill queue (mob death lines)
+    SetCombatStatus(false)
 
     -- Print Outgoing Damage Stats
     for id, data in pairs(fightData.outgoing) do
-        -- Filter: skip sessions where only passive procs dealt damage
-        local PROC_ONLY_SKILLS = { ["Electric Shock"] = true }
-        local skipOutgoing = false
-        if CONFIG.FILTER_STATIC_SHOCK then
-            local skillCount = 0
-            local onlyProcs = true
-            for skill, _ in pairs(data.skills or {}) do
-                skillCount = skillCount + 1
-                if not PROC_ONLY_SKILLS[skill] then onlyProcs = false end
-            end
-            if skillCount > 0 and onlyProcs then skipOutgoing = true end
-        end
-
-        if not skipOutgoing then
+        do
         local tName = data.name or "Target"
         local snap = data.statSnapshot or {}
         local targetingStr = snap.targetIsTargetingPlayer and " [↔]" or ""
@@ -1307,12 +2688,19 @@ local function FinishFight()
                 0.55, 0.55, 0.55, { logType = "summary" })
         end
 
-        -- Mitigation & pen estimates (per damage type)
+        -- API-DEAD, PRESERVED FOR RESTORE (not deleted): the per-damage-type Mitigation & pen breakdown
+        -- needs the enemy's UnitInfo/UnitModifierInfo (armor%/resist%/toughness/avoidance/incoming-mods),
+        -- which the 2026-06-18 lockdown blocks for non-team units -> every enemy line reads 0 and the
+        -- pen/hit lines have nothing to apply against. GATED OFF behind CONFIG.MIT_BREAKDOWN (default
+        -- false). If Aguru re-allows enemy UnitInfo for the "target" token, flip that flag true and this
+        -- whole block lights back up with real data. (The event-sourced per-type "X mitigated (Y%)"
+        -- lines above are NOT here -- they always work.)
         local snap = data.statSnapshot
-        if snap then
+        if CONFIG.MIT_BREAKDOWN and snap then
             local physPct  = (snap.targetArmorPct  or 0) / 100
             local magicPct = (snap.targetResistPct or 0) / 100
             local mitColor = { 0.5, 0.8, 1 }
+            local hasTargetStats = (snap.targetArmorPct or 0) > 0 or (snap.targetResistPct or 0) > 0
 
             -- Toughness (PvP only — applied first, before armor/resist)
             local toughness = snap.targetToughness or 0
@@ -1326,8 +2714,6 @@ local function FinishFight()
             end
             local penColor = { 0.4, 1, 0.4 }
 
-            -- Use exact raw damage from COMBAT_MSG arg[11] when available,
-            -- fall back to dealt+absorbed estimate when arg[11] was zero/missing.
             -- rawPhys/rawRanged/rawMagic/hasExactRaw already defined above in totalDmg block
             local rawMeleeRanged = rawPhys + rawRanged
 
@@ -1372,7 +2758,6 @@ local function FinishFight()
             end
 
             -- With exact raw data: mitigated = raw - dealt (no estimation needed for total)
-            -- Armor/resist formulas still use snapshot percentages for pen calculations
             local estArmorLost = hasExactRaw
                 and math.max(0, postToughMeleeRanged - (data.physDmg or 0) - (data.rangedDmg or 0))
                 or  (postToughMeleeRanged > 0 and (postToughMeleeRanged * penAdjPhysPct) or 0)
@@ -1387,10 +2772,12 @@ local function FinishFight()
                                or                                      "Phys"
                 local armorMitStr = estArmorLost > 0
                     and string.format(" | Lost %d dmg", math.floor(estArmorLost)) or ""
-                RecordLogForTarget(id, tName,
-                    string.format("  %s def: %d (%.1f%% base | %.1f%% eff)%s",
-                        physLabel, tDef, snap.targetArmorPct or 0, penAdjPhysPct * 100, armorMitStr),
-                    mitColor[1], mitColor[2], mitColor[3], { logType = "summary" })
+                if hasTargetStats then
+                    RecordLogForTarget(id, tName,
+                        string.format("  %s def: %d (%.1f%% base | %.1f%% eff)%s",
+                            physLabel, tDef, snap.targetArmorPct or 0, penAdjPhysPct * 100, armorMitStr),
+                        mitColor[1], mitColor[2], mitColor[3], { logType = "summary" })
+                end
                 -- Phys pen + bonus
                 local physPenStr = string.format("  %s pen: %d", physLabel, pPen)
                 if physPenBonus > 0 then
@@ -1423,10 +2810,12 @@ local function FinishFight()
             if rawMagic > 0 then
                 local magicMitStr = estMagicLost > 0
                     and string.format(" | Lost %d dmg", math.floor(estMagicLost)) or ""
-                RecordLogForTarget(id, tName,
-                    string.format("  Magic res: %d (%.1f%% base | %.1f%% eff)%s",
-                        tRes, snap.targetResistPct or 0, penAdjMagicPct * 100, magicMitStr),
-                    mitColor[1], mitColor[2], mitColor[3], { logType = "summary" })
+                if hasTargetStats then
+                    RecordLogForTarget(id, tName,
+                        string.format("  Magic res: %d (%.1f%% base | %.1f%% eff)%s",
+                            tRes, snap.targetResistPct or 0, penAdjMagicPct * 100, magicMitStr),
+                        mitColor[1], mitColor[2], mitColor[3], { logType = "summary" })
+                end
                 -- Magic pen + bonus
                 local magicPenStr = string.format("  Magic pen: %d", mPen)
                 if magicPenBonus > 0 then
@@ -1457,12 +2846,13 @@ local function FinishFight()
             if imv ~= 0 then table.insert(modParts, string.format("Melee %+d/hit", imv)) end
             if irv ~= 0 then table.insert(modParts, string.format("Ranged %+d/hit", irv)) end
             if isv ~= 0 then table.insert(modParts, string.format("Magic %+d/hit", isv)) end
-            if #modParts > 0 then
+            local modParts2 = {}
+            for _, p in ipairs(modParts) do modParts2[#modParts2 + 1] = p end
+            if #modParts2 > 0 then
                 RecordLogForTarget(id, tName,
-                    "  Modifiers: " .. table.concat(modParts, " | "),
+                    "  Modifiers: " .. table.concat(modParts2, " | "),
                     mitColor[1], mitColor[2], mitColor[3], { logType = "summary" })
             end
-
         end
 
         if data.ccDurations then
@@ -1725,7 +3115,7 @@ local function FinishFight()
             RecordLogForTarget(id, tName, shStr, 0.5, 0.8, 1, { logType = "summary" })
         end
 
-        end -- skipOutgoing
+        end -- per-target outgoing summary
     end
 
     -- Reset Zeal state for next fight
@@ -1783,6 +3173,26 @@ local function FinishFight()
                 sessionByTarget[name].totalAbsorbed = totalAbs
             end
 
+            -- Shield/conversion absorbs (Absorb Damage, runes, Insulating Lens) -- player-level
+            -- mitigation surfaced here for the tanking view. Header total + one line per source
+            -- (sorted big->small). Each source line uses the "+ Skill: N" shape so the summary
+            -- render attaches that skill's icon; the "(Rank N)" suffix is stripped so it resolves.
+            if CONFIG._shieldAbsorb then
+                local order, sTot = {}, 0
+                for sk, amt in pairs(CONFIG._shieldAbsorb) do order[#order + 1] = sk; sTot = sTot + amt end
+                if sTot > 0 then
+                    RecordLogForTarget(name, displayName, "  Shields absorbed: " .. sTot,
+                        0.5, 0.85, 1, { logType = "summary" })
+                    table.sort(order, function(a, b) return CONFIG._shieldAbsorb[a] > CONFIG._shieldAbsorb[b] end)
+                    for _, sk in ipairs(order) do
+                        local disp = (sk:gsub("%s*%(Rank%s*%d+%)", ""))
+                        RecordLogForTarget(name, displayName,
+                            "  + " .. disp .. ": " .. CONFIG._shieldAbsorb[sk],
+                            0.4, 0.75, 0.95, { logType = "summary" })
+                    end
+                end
+            end
+
             local defSnap = data.defSnap
             if defSnap then
                 local rawPhys        = (data.physDmg   or 0) + (data.physAbsorbed   or 0)
@@ -1801,7 +3211,7 @@ local function FinishFight()
                         string.format("  Your magic res: %d (%.1f%% base)", defSnap.resist, defSnap.resistPct),
                         mitColor[1], mitColor[2], mitColor[3], { logType = "summary" })
                 end
-                if defSnap.toughness > 0 then
+                if defSnap.toughness > 0 and data.isPvP then  -- toughness is PvP-only
                     RecordLogForTarget(name, displayName,
                         string.format("  Your Toughness: %d", defSnap.toughness),
                         mitColor[1], mitColor[2], mitColor[3], { logType = "summary" })
@@ -1849,6 +3259,18 @@ local function FinishFight()
                         bulwarkPrevented, bulwarkDps),
                     bulwarkColor[1], bulwarkColor[2], bulwarkColor[3], { logType = "summary" })
             end
+
+            -- Shield absorb summary (per player-cast shield active during this fight)
+            if data.shieldAbsorbed then
+                local shieldColor = { 0.5, 0.8, 1 }
+                for sname, samt in pairs(data.shieldAbsorbed) do
+                    if samt > 0 then
+                        RecordLogForTarget(name, displayName,
+                            string.format("  [S] %s absorbed: %d dmg", sname, samt),
+                            shieldColor[1], shieldColor[2], shieldColor[3], { logType = "summary" })
+                    end
+                end
+            end
         end
 
         if sessionByTarget[name] then sessionByTarget[name].isIncoming = true end
@@ -1878,6 +3300,47 @@ local function FinishFight()
                 healSessionByTarget[key].duration = duration
             end
             RecordHealLog(key, targetName, string.format("  Total: %d (%.0f HPS | %.1fs)", totalHeal, hps, duration), c[1]*0.7, c[2]*0.7, c[3]*0.7, { logType = "summary" })
+            local critHealBonus  = data.critHealBonus or 0
+            local zealHealBonus  = data.zealHealBonus or 0
+            local healPowerBonus = data.healPowerBonus or 0
+            local healMulBonus   = data.healMulBonus or 0
+            local healCrits      = data.healCrits or 0
+            if critHealBonus > 0 then
+                RecordHealLog(key, targetName,
+                    string.format("  [*] Crit healing: +%d (+%.0f HPS) over %d crits",
+                        critHealBonus, critHealBonus / duration, healCrits),
+                    1, 0.85, 0.2, { logType = "summary" })
+            end
+            if zealHealBonus > 0 then
+                RecordHealLog(key, targetName,
+                    string.format("  [Z] Zeal crit healing: +%d (+%.0f HPS)",
+                        zealHealBonus, zealHealBonus / duration),
+                    0.85, 0.4, 1, { logType = "summary" })
+            end
+            if healPowerBonus > 0 then
+                RecordHealLog(key, targetName,
+                    string.format("  [H] Heal power (Rhythm/Ode): +%d (+%.0f HPS)",
+                        healPowerBonus, healPowerBonus / duration),
+                    0.5, 1, 0.8, { logType = "summary" })
+            end
+            if healMulBonus > 0 then
+                RecordHealLog(key, targetName,
+                    string.format("  [H] Heal %% buffs: +%d (+%.0f HPS)",
+                        healMulBonus, healMulBonus / duration),
+                    0.5, 1, 0.8, { logType = "summary" })
+            end
+            if (critHealBonus + zealHealBonus + healPowerBonus + healMulBonus) > 0 then
+                local baseHeal = math.max(0, totalHeal - critHealBonus - zealHealBonus - healPowerBonus - healMulBonus)
+                RecordHealLog(key, targetName,
+                    string.format("  Base healing: %d (%.0f HPS)", baseHeal, baseHeal / duration),
+                    c[1]*0.7, c[2]*0.7, c[3]*0.7, { logType = "summary" })
+            end
+            if (data.overhealTotal or 0) > 0 then
+                local ohPctSum = totalHeal > 0 and math.floor(data.overhealTotal / totalHeal * 100) or 0
+                RecordHealLog(key, targetName,
+                    string.format("  Overheal: %d (%d%% of total)", data.overhealTotal, ohPctSum),
+                    0.55, 0.75, 0.95, { logType = "summary" })
+            end
             local hSnap = data.healSnap
             if hSnap then
                 local statParts = {}
@@ -1935,28 +3398,47 @@ local function FinishFight()
     end
     end -- SHOW_HEALS
 
-    LogEntry("---------------------------", 0.5, 0.5, 0.5)
+    -- Per-fight revive tally (single-target Revive YOU cast -- often mid-fight via a stealth
+    -- combat-drop, so it belongs to THIS fight). Emitted at fight end; the count then resets.
+    if (CONFIG._fightReviveCount or 0) > 0 then
+        LogEntry(string.format("      Revives this fight: %d", CONFIG._fightReviveCount), 0.4, 1, 0.7)
+    end
+    CONFIG._fightReviveCount = 0
 
-    -- Save damage sessions
+    -- Fight separator in the live feed -- only when this fight actually logged a live line,
+    -- so empty/aborted combats (brief flag, stray proc, target tab) don't spam dividers.
+    if CONFIG._liveSinceDiv then
+        LogEntry("---------------------------", 0.5, 0.5, 0.5)
+    end
+    CONFIG._liveSinceDiv = false  -- reset for the next fight
+
+    -- Save damage sessions. One fightId per FinishFight tags all of this fight's sessions
+    -- (player + recap) so history can group by fight instead of by name.
     local timeStr = GetTimestamp()
     local savedCount = 0
+    CONFIG._fightId = (CONFIG._fightId or 0) + 1
+    -- Freeze this fight's Raid Meter aggregate, keyed by fightId (parallel to allSessions).
+    if CONFIG.RAID_METER and CONFIG._meterAgg then pcall(function()
+        CONFIG._fightMeters = CONFIG._fightMeters or {}
+        local mrows, mdur = {}, 0
+        for _, a in pairs(CONFIG._meterAgg) do mrows[#mrows + 1] = a end
+        for _, s in pairs(sessionByTarget) do if (s.duration or 0) > mdur then mdur = s.duration end end
+        CONFIG._fightMeters[CONFIG._fightId] = { rows = mrows, durSec = mdur, time = timeStr }
+        local minKeep = CONFIG._fightId - 60   -- keep only the most recent ~60 fights' meters
+        for fid in pairs(CONFIG._fightMeters) do if fid <= minKeep then CONFIG._fightMeters[fid] = nil end end
+    end) end
     for id, data in pairs(sessionByTarget) do
-        -- Filter: skip proc-only sessions from history
-        local PROC_ONLY_SKILLS = { ["Electric Shock"] = true }
-        local skipSave = false
-        if CONFIG.FILTER_STATIC_SHOCK and data.logs and #data.logs > 0 then
-            local allProcs = true
-            for _, entry in ipairs(data.logs) do
-                if entry.skill and not PROC_ONLY_SKILLS[entry.skill] then allProcs = false; break end
-            end
-            if allProcs then skipSave = true end
-        end
-        if not skipSave and #data.logs > 0 then
+        if data.logs and #data.logs > 0 then
             table.insert(allSessions, {
-                time = timeStr, targetName = data.name, logs = data.logs,
+                time = timeStr, fightId = CONFIG._fightId, targetName = data.name, targetId = id, logs = data.logs,
+                who = (data.name == PLAYER_NAME) and "ally" or CONFIG._classifyUnit(data.name, id),  -- opponent class (icon + WHO filter)
                 isIncoming = data.isIncoming, isOutgoing = data.isOutgoing,
                 dps = data.dps or 0, totalDmg = data.totalDmg or 0,
-                duration = data.duration or 0, totalAbsorbed = data.totalAbsorbed or 0
+                duration = data.duration or 0, totalAbsorbed = data.totalAbsorbed or 0,
+                endedInDeath = CONFIG._diedThisFight,
+                endedInKill = (data.isOutgoing and fightData.killedNames and fightData.killedNames[data.name]) and true or nil,
+                wasDuel = CONFIG._fightWasDuel or nil,
+                targetClass = data.targetClass or (fightData.outgoing[id] and fightData.outgoing[id].targetClass) or nil
             })
             savedCount = savedCount + 1
         end
@@ -1968,25 +3450,52 @@ local function FinishFight()
             local isDone = string.sub(id, 1, 5) == "done_"
             local isRecv = string.sub(id, 1, 5) == "recv_"
             table.insert(allSessions, {
-                time = timeStr, targetName = data.name, logs = data.logs,
+                time = timeStr, fightId = CONFIG._fightId, targetName = data.name, logs = data.logs,
+                who = (data.name == PLAYER_NAME) and "ally" or CONFIG._classifyUnit(data.name, nil),  -- the healed/healer unit's class
                 isHeal = true, isHealDone = isDone, isHealReceived = isRecv,
-                totalHeal = data.totalHeal or 0, hps = data.hps or 0, duration = data.duration or 0
+                totalHeal = data.totalHeal or 0, hps = data.hps or 0, duration = data.duration or 0,
+                endedInDeath = CONFIG._diedThisFight, targetClass = data.targetClass
             })
             savedCount = savedCount + 1
         end
     end
 
-    -- Cap session history to prevent unbounded memory growth (batch copy, avoids O(n) shifts)
-    if #allSessions > 100 then
+    -- Authoritative deaths from the UNIT_DEAD event override the HP heuristics on ally recaps.
+    if CONFIG._deadByEvent then
+        for nm in pairs(CONFIG._deadByEvent) do
+            if recapData[nm] then recapData[nm].died = true; recapData[nm].keep = true end
+        end
+        CONFIG._deadByEvent = nil
+    end
+
+    -- Save unit recap sessions. Floodgates: every unit (ally/enemy/mob) with any logged combat is
+    -- kept (rec.keep is set on the first line); the top-bar toggles filter the view. `who` carries
+    -- the unit's class (ally/enemy/mob) for the name icon and the WHO filter.
+    for allyName, rec in pairs(recapData) do
+        if #rec.logs > 0 and rec.keep then
+            table.insert(allSessions, {
+                time = timeStr, fightId = CONFIG._fightId, targetName = rec.name, logs = rec.logs, isRecap = true,
+                who = rec.who,
+                endedInDeath = rec.died  -- the unit died -> recap [DIED] tag
+            })
+            savedCount = savedCount + 1
+        end
+    end
+
+    -- Session cap kept high for the tester build so testers can accumulate lots of history
+    -- (restore to ~300 for a public release).
+    if #allSessions > 999999 then
         local trimmed = {}
-        local start = #allSessions - 100 + 1
+        local start = #allSessions - 999999 + 1
         for i = start, #allSessions do trimmed[#trimmed + 1] = allSessions[i] end
         allSessions = trimmed
     end
 
-    if savedCount > 0 then sessionScrollOffset = 0; UpdateSessionList() end
-    currentSessionLogs = {}; sessionByTarget = {}; healSessionByTarget = {}
-    fightData = { outgoing = {}, incoming = {} }; healData = { done = {}, received = {} }
+    if savedCount > 0 and sidebarMode ~= "SESSIONS" then sessionScrollOffset = 0 end  -- don't jump the list when you're drilled in
+    UpdateSessionList(true)
+    currentSessionLogs = {}; sessionByTarget = {}; healSessionByTarget = {}; recapData = {}
+    fightData = { outgoing = {}, incoming = {} }; healData = { done = {}, received = {} }; CONFIG._shieldAbsorb = nil; CONFIG._fightWasDuel = nil
+    if CONFIG._meterReset then CONFIG._meterReset() end
     activeDots = {}; activeCCSessions = {}
     -- Prune activeDebuffsCache: keep only current target and player, discard old unit entries
     local keepPlayer = api.Unit:GetUnitId("player")
@@ -2072,9 +3581,94 @@ local function ScanUnitDebuffs(unitTag)
     activeDebuffsCache[unitID] = currentScan
 end
 
+-- === ANCESTRAL- (HEIR-) SKILL VARIANT ICONS ===
+-- Same-named skills (e.g. all 3 forms of "Meteor Strike") share a combat-log name but have
+-- different icons. The game fires HEIR_SKILL_LEARN(skillName, pos) when you switch a variant; we
+-- map (skill, pos) -> icon via skill_variants.lua and stamp it (ResolveSkillIcon checks
+-- CONFIG._detectedVariant). The event only fires ON a switch, so we PERSIST the chosen pos per
+-- skill to heir_variants.txt and reload it at login.
+
+local HEIR_FILE = "CombatLogPro/heir_variants.txt"
+
+-- Apply a (skill, pos) choice: set the variant icon, or clear to base when pos isn't a known
+-- variant (you switched back to the base node, or HEIR_SKILL_RESET). `persist` also records the
+-- choice and saves the file. Returns the icon (or nil for base).
+local function ApplyHeirVariant(skill, pos, persist)
+    if not skill or skill == "" then return end
+    CONFIG._detectedVariant = CONFIG._detectedVariant or {}
+    CONFIG._heirPos = CONFIG._heirPos or {}
+    local sig = SKILL_VARIANTS[skill]
+    if not sig then return end  -- not a same-named/variant skill -> nothing to do
+    pos = tonumber(pos)
+    local icon = (pos and sig.byPos) and sig.byPos[pos] or nil  -- nil = base node
+    if CONFIG._detectedVariant[skill] ~= icon then
+        CONFIG._detectedVariant[skill] = icon       -- nil -> ResolveSkillIcon falls through to base
+        iconPathCache[skill] = nil                  -- re-resolve with the new icon
+    end
+    if persist then
+        CONFIG._heirPos[skill] = pos
+        pcall(function() api.File:Write(HEIR_FILE, CONFIG._heirPos) end)
+    end
+    return icon
+end
+
+-- Load persisted variant choices at startup (HEIR_SKILL_LEARN doesn't fire on login).
+local function LoadHeirVariants()
+    CONFIG._heirPos = {}
+    local ok, t = pcall(function() return api.File:Read(HEIR_FILE) end)
+    if ok and type(t) == "table" then
+        for skill, pos in pairs(t) do
+            ApplyHeirVariant(skill, pos, false)
+            CONFIG._heirPos[skill] = tonumber(pos)
+        end
+    end
+end
+
+-- Incoming variant: a same-named skill cast AT you carries no variant info, but a NON-base variant
+-- leaves a uniquely-named debuff on you (readable on the "player" token). Match it to identify the
+-- caster's variant; nil (base) if none. Best-effort -- only forms with a distinct debuff. See the
+-- `debuffs` maps in skill_variants.lua.
+local function IncomingVariantIcon(skill)
+    local sig = SKILL_VARIANTS[skill]
+    if not sig or not sig.debuffs then return nil end
+    local okC, cnt = pcall(function() return api.Unit:UnitDeBuffCount("player") end)
+    if not okC or not cnt or cnt == 0 then return nil end
+    for i = 1, cnt do
+        local d = api.Unit:UnitDeBuff("player", i)
+        if d and d.buff_id then
+            local nm = buffDB[d.buff_id] or buffNameCache[d.buff_id]
+            if not nm then
+                local okT, tt = pcall(function() return api.Ability:GetBuffTooltip(d.buff_id) end)
+                nm = (okT and type(tt) == "table" and tt.name) or d.name
+                if nm then buffNameCache[d.buff_id] = nm end
+            end
+            if nm and sig.debuffs[nm] then return sig.debuffs[nm] end
+        end
+    end
+    return nil
+end
+
+-- Expose on CONFIG so the big event-handler closure + Load can reach these WITHOUT taking new
+-- upvalues (it's near Lua's 60-upvalue cap -- all added state goes through CONFIG already).
+CONFIG._skillVariants = SKILL_VARIANTS
+CONFIG._applyHeir = ApplyHeirVariant
+CONFIG._loadHeir = LoadHeirVariants
+CONFIG._incomingVariantIcon = IncomingVariantIcon
+CONFIG._detectedVariant = CONFIG._detectedVariant or {}  -- skill name -> variant icon (base = nil)
+
 -- === EVENT HANDLER ===
 local function OnLiveEvent(self, event, ...)
     local args = { ... }; if #args == 0 and arg then args = arg end
+
+    -- Ancestral-variant icon: the game fires these when you switch/reset a heir (ancestral) skill.
+    -- HEIR_SKILL_LEARN(skillName, pos) -> point that skill's icon at the variant; RESET -> base.
+    if event == "HEIR_SKILL_LEARN" then
+        CONFIG._applyHeir(tostring(args[1] or ""), args[2], true)
+        return
+    elseif event == "HEIR_SKILL_RESET" then
+        CONFIG._applyHeir(tostring(args[1] or ""), nil, true)
+        return
+    end
 
     if event == "COMBAT_TEXT" then
         local sourceUnitId = tostring(args[1] or "")
@@ -2082,16 +3676,80 @@ local function OnLiveEvent(self, event, ...)
         if targetUnitId == PLAYER_UNIT_ID and sourceUnitId ~= "" then
             lastIncomingSourceId = sourceUnitId
         end
+        if CONFIG.RAID_METER then CONFIG._ctPush(sourceUnitId, targetUnitId, tonumber(args[3] or 0)) end
         return
     end
 
-    if event == "COMBAT_MSG" then
-        -- patch 243+: dump all event args to chat for debugging
-        if CONFIG.DEBUG_LOG_EVENTS then
-            LogEventToFile(event, args)
+    if event == "UNIT_DEAD" then
+        -- AUTHORITATIVE death event (proven via the `numbers` addon). Fires for ANY unit death.
+        -- args = (unitId, lostExpStr, durabilityLossRatio). GetUnitInfoById resolves the dead
+        -- unit's .name and .type ("character" = a player). This replaces HP-poll guesswork.
+        local deadId = tostring(args[1] or "")
+        if deadId == "" then return end
+        local okI, info = pcall(function() return api.Unit:GetUnitInfoById(deadId) end)
+        local dName = (okI and info and info.name) or "?"
+        local dType = (okI and info and info.type) or "?"
+        -- A just-dead MOB's unit info is often already gone (name "?"). Recover the name from the
+        -- outgoing session we already have for that unit id, so mob kills still log + tag [KILL].
+        if dName == "?" and fightData.outgoing and fightData.outgoing[deadId] and fightData.outgoing[deadId].name then
+            dName = fightData.outgoing[deadId].name
         end
+        local isSelf = (deadId == PLAYER_UNIT_ID) or (dName ~= "?" and dName == PLAYER_NAME)
+        -- Killer attribution (from the last damage source we recorded for this unit id).
+        local killer = CONFIG._lastDmgSrc and CONFIG._lastDmgSrc[deadId]
+        local killStr = ""
+        if killer and killer ~= "" and killer ~= dName then
+            killStr = (killer == PLAYER_NAME) and "  (your kill)" or ("  (killed by " .. killer .. ")")
+        end
+        if isSelf then
+            -- Latch the death log (cleared only when HP recovers, NOT by FinishFight) so it fires
+            -- exactly once per actual death -- no re-spam while the corpse lingers in combat.
+            if not CONFIG._playerDeadLatch then CONFIG._playerDeadLatch = true; CONFIG._playerDied = true; LogEntry("YOU DIED" .. killStr, 1, 0.2, 0.2, { death = true }) end
+        elseif dName ~= "?" then
+            CONFIG._deadByEvent = CONFIG._deadByEvent or {}
+            CONFIG._deadByEvent[dName] = true  -- consumed by FinishFight -> authoritative ally recap [DIED]
+            local youDamaged = fightData.outgoing and fightData.outgoing[deadId] ~= nil
+            if youDamaged then fightData.killedNames = fightData.killedNames or {}; fightData.killedNames[dName] = true
+                fightData.killedIds = fightData.killedIds or {}; fightData.killedIds[deadId] = true end  -- per-INSTANCE kill
+            -- Kill feed: only deaths your SIDE was INVOLVED in -- a unit you damaged (your kill / a
+            -- foe you fought), one of your own party/raid (a teammate dropping), OR a unit your
+            -- party/raid killed. That last clause covers HEALERS: they deal no damage, so without it
+            -- they'd see only teammate deaths and miss every kill their team scored. Random deaths
+            -- from other people's fights (sieges, crowded zones) are still skipped -- pure noise.
+            -- Deduped by UNIT ID against the combat-state path.
+            CONFIG._deathLogged = CONFIG._deathLogged or {}
+            local involved = youDamaged or (GetAllyTag(dName) ~= nil)
+                             or (killer and GetAllyTag(killer) ~= nil)
+            if involved and not CONFIG._deathLogged[deadId] then
+                CONFIG._deathLogged[deadId] = true
+                LogEntry(dName .. " DIED" .. killStr, 1, 0.5, 0.2, { death = true })
+            end
+        end
+        return
+    end
+
+
+    if event == "COMBAT_MSG" then
         local unitID = tostring(args[1] or "0")
         local actionType = tostring(args[2] or "")
+        -- ENVIRONMENTAL_DAMAGE (falling/drowning/zone fields) uses a SHIFTED arg layout:
+        -- [3]src [4]tgt [5]cause [7]amount [8]powerType. Remap it into the standard damage
+        -- shape so the normal incoming path handles it -- starts a session, logs the hit,
+        -- and (combat having started) the HP==0 death poll catches a lethal fall/drown even
+        -- out of combat. All environmental damage is logged (no threshold), per design.
+        if actionType == "ENVIRONMENTAL_DAMAGE" then
+            local envAmt = tonumber(args[7]) or 0
+            local cause  = tostring(args[5] or "Environment")
+            cause = cause:sub(1, 1):upper() .. cause:sub(2):lower()  -- FALLING -> Falling
+            args[6]  = cause              -- skill label = the cause
+            args[7]  = "PHYSICAL"         -- damage-type slot (env ignores armor; label only)
+            args[8]  = -envAmt            -- standard damage slot (negative = incoming)
+            args[10] = tostring(args[9] or "HIT")
+            args[11] = envAmt             -- raw pre-mitigation = amount (no mitigation chain)
+            -- Leave source/target as-is (you). With the ENVIRONMENTAL_DAMAGE guard on the
+            -- outgoing branch below, a self-fall routes to the INCOMING side and groups under
+            -- YOUR name, with "Falling" as the skill -- not under a fake "Falling" attacker.
+        end
         local sourceName = tostring(args[3] or "Unknown")
         local targetName = tostring(args[4] or "Unknown")
         local skill = tostring(args[6] or "Attack")
@@ -2120,18 +3778,117 @@ local function OnLiveEvent(self, event, ...)
         local absDmg = math.abs(damage)
         local now = frameNow  -- cached by OnUpdate, avoids GetUiMsec() per event
 
+        if CONFIG.RAID_METER and inCombat then
+            -- Effect-ticks (HoT/DoT) report the EFFECT as the source; attribute them to the real
+            -- caster via the paired COMBAT_TEXT (matched by target + amount). Falls back to the
+            -- effect name (-> classified "other" -> excluded) when no caster resolves.
+            local meterSrc = sourceName
+            if sourceName == skill then
+                meterSrc = CONFIG._resolveTickCaster(unitID, absDmg) or sourceName
+            end
+            -- HOTFIX: pcall-guard so a fault in the meter tap can NEVER abort the combat handler
+            -- (which would drop ALL damage/heal logging). Captures the first error for diagnosis.
+            local mok, merr = pcall(CONFIG._meterTap, meterSrc, absDmg, isHeal)
+            if not mok and not CONFIG._meterErr then
+                CONFIG._meterErr = true
+                pcall(function() api.File:Write("CombatLogPro/meter_err.txt", "meterTap error: " .. tostring(merr)) end)
+            end
+        end
+
+        -- Killer attribution: remember who last DAMAGED each unit (by its unit id) so a
+        -- following UNIT_DEAD can show "X killed by Y". Damage only -- skip heals/self-procs.
+        if not isHeal and absDmg > 0 and sourceName ~= "Unknown" and sourceName ~= targetName then
+            CONFIG._lastDmgSrc = CONFIG._lastDmgSrc or {}
+            CONFIG._lastDmgSrc[unitID] = sourceName
+        end
+
+        -- Defensive self-procs (Absorb Damage, damage-converting runes) arrive as self
+        -- SPELL_HEALED on every incoming hit. They're mitigation, not healing -- tally them
+        -- as "shield absorbed" (surfaced in the incoming recap) and drop the event so it
+        -- neither spams the live feed nor inflates heal stats. (Insulating Lens emits no
+        -- combat event at all, so it cannot be tracked.)
+        if isHeal and sourceName == targetName and
+           (string.lower(skill) == "absorb damage" or string.find(string.lower(skill), "rune")) then
+            if inCombat then
+                CONFIG._shieldAbsorb = CONFIG._shieldAbsorb or {}
+                CONFIG._shieldAbsorb[skill] = (CONFIG._shieldAbsorb[skill] or 0) + absDmg
+            end
+            return
+        end
+
+        -- Ally Damage Recap: record any hit/heal landing on a party/raid member.
+        -- Runs before the heal/miss/own-vs-other early-returns so it sees ALL events.
+        if CONFIG.LOG_ALLY_RECAP
+           or (isHeal and sourceName == PLAYER_NAME and CONFIG.SHOW_HEALS) then
+            RecordAllyRecap(sourceName, targetName, skill, absDmg, isHeal,
+                string.find(upHit, "CRITICAL") ~= nil, unitID)
+        end
+
         -- HEALS: route to separate tracking, never trigger combat
         if isHeal and absDmg > 0 and CONFIG.SHOW_HEALS then
             local c = GetSafeColor(CONFIG.COL_HEAL)
             if sourceName == PLAYER_NAME then
-                RecordHealLog("done_" .. targetName, targetName, string.format("+ %s -> %s: %d", skill, targetName, absDmg), c[1], c[2], c[3],
-                    { logType = "heal", skill = skill, source = sourceName, target = targetName, damage = absDmg })
+                -- (Overheal capture moved into RecordAllyRecap so it reads HP for ANY
+                --  party/raid member via the team tag, not just the selected target.)
+
+                -- HP% suffix = the heal TARGET's resulting HP%. Mirror the damage-line read so heals
+                -- get it too: player handle for self-heals (works even while targeting an enemy),
+                -- else the target's id (any ally/unit), else the current-target handle as a fallback.
+                local hpSuffix = ""
+                do
+                    local hp, mhp
+                    if targetName == PLAYER_NAME then
+                        local okH, h = pcall(function() return api.Unit:UnitHealth("player") end)
+                        local okM, m = pcall(function() return api.Unit:UnitMaxHealth("player") end)
+                        if okH and okM then hp, mhp = h, m end
+                    end
+                    if not (hp and mhp) and unitID and unitID ~= "" and unitID ~= "0" then
+                        local okI, info = pcall(function() return api.Unit:GetUnitInfoById(unitID) end)
+                        if okI and type(info) == "table" then
+                            hp  = tonumber(info.hp or info.health or info.current_health)
+                            mhp = tonumber(info.max_health or info.max_hp or info.maxHealth)
+                        end
+                    end
+                    if not (hp and mhp) then
+                        local okN, tn = pcall(function() return api.Unit:UnitName("target") end)
+                        if okN and tn == targetName then
+                            local okH, h = pcall(function() return api.Unit:UnitHealth("target") end)
+                            local okM, m = pcall(function() return api.Unit:UnitMaxHealth("target") end)
+                            if okH and okM then hp, mhp = h, m end
+                        end
+                    end
+                    if hp and mhp and mhp > 0 then
+                        local pct = math.floor(hp / mhp * 100)
+                        if pct < 0 then pct = 0 elseif pct > 100 then pct = 100 end
+                        hpSuffix = string.format(" [%d%%]", pct)
+                    end
+                end
+
+                -- Heal crit detection (parseResult isn't computed yet in the heal path):
+                -- check the hit-type slot plus args 9-12 for "CRITICAL".
+                local healCrit = string.find(upHit, "CRITICAL") ~= nil
+                if not healCrit then
+                    for ci = 9, 12 do
+                        if string.find(string.upper(tostring(args[ci] or "")), "CRITICAL") then healCrit = true; break end
+                    end
+                end
+
                 if inCombat then
                     if not healData.done[targetName] then
                         local okP, pInfo = pcall(function() return api.Unit:UnitInfo("player") end)
                         if not okP then pInfo = {} end
                         healData.done[targetName] = {
                             skills = {}, startTime = now, lastUpdate = now,
+                            critHealBonus = 0, zealHealBonus = 0, healCrits = 0,
+                            -- Capture class only when the heal target IS your current target
+                            -- (cheap, no extra lookups); lets healed ally players show a role icon.
+                            targetClass = (function()
+                                local okN, tn = pcall(function() return api.Unit:UnitName("target") end)
+                                if not (okN and tn == targetName) then return nil end
+                                local okC, c = pcall(function() return api.Ability:GetUnitClassName("target") end)
+                                if okC and c and c ~= "" and tostring(c):lower() ~= "pending" then return tostring(c) end
+                                return nil
+                            end)(),
                             healSnap = {
                                 healMul       = tonumber(pInfo.heal_mul            or 0),
                                 healCritRate  = tonumber(pInfo.heal_critical_rate  or 0),
@@ -2140,12 +3897,88 @@ local function OnLiveEvent(self, event, ...)
                             },
                         }
                     end
-                    healData.done[targetName].skills[skill] = (healData.done[targetName].skills[skill] or 0) + absDmg
-                    healData.done[targetName].lastUpdate = now
+                    local hd = healData.done[targetName]
+                    local critB = (hd.healSnap and hd.healSnap.healCritBonus) or 50
+
+                    -- Attribute crit (and Zeal's +75% crit healing), mirroring the damage crit math.
+                    local critBonus, zealHealBonus = 0, 0
+                    if healCrit then
+                        if zealActive then
+                            local denom     = 100 + critB + 75
+                            local critTotal = math.floor(absDmg * (critB + 75) / denom)
+                            critBonus     = math.floor(critTotal * critB / (critB + 75))
+                            zealHealBonus = critTotal - critBonus
+                        else
+                            critBonus = math.floor(absDmg * critB / (100 + critB))
+                        end
+                        hd.healCrits = (hd.healCrits or 0) + 1
+                    end
+
+                    -- Heal-power buffs: flat heal_dps gain over the idle baseline (Rhythm/Ode),
+                    -- plus heal_mul %. Computed off the pre-crit portion to avoid overlap.
+                    local preCrit = math.max(0, absDmg - critBonus - zealHealBonus)
+                    local healPowerBonus, healMulBonus = 0, 0
+                    local hDps  = bonuses.healDps or 0
+                    local hBase = bonuses.baseHealDps or hDps
+                    if hDps > 0 and hDps > hBase then
+                        healPowerBonus = math.floor(preCrit * (hDps - hBase) / hDps)
+                    end
+                    local hMul = bonuses.healMul or 0
+                    if hMul > 0 then
+                        healMulBonus = math.floor((preCrit - healPowerBonus) * hMul / (100 + hMul))
+                    end
+
+                    local baseHeal = math.max(0, absDmg - critBonus - zealHealBonus - healPowerBonus - healMulBonus)
+
+                    hd.skills[skill]  = (hd.skills[skill] or 0) + absDmg
+                    hd.critHealBonus  = (hd.critHealBonus or 0) + critBonus
+                    hd.zealHealBonus  = (hd.zealHealBonus or 0) + zealHealBonus
+                    hd.healPowerBonus = (hd.healPowerBonus or 0) + healPowerBonus
+                    hd.healMulBonus   = (hd.healMulBonus or 0) + healMulBonus
+                    hd.lastUpdate     = now
+
+                    local critTag = healCrit and " (Crit)" or ""
+                    RecordHealLog("done_" .. targetName, targetName,
+                        string.format("+ %s -> %s: %d%s%s", skill, targetName, absDmg, critTag, hpSuffix),
+                        c[1], c[2], c[3],
+                        { logType = "heal", skill = skill, source = sourceName, target = targetName, damage = absDmg, dmgTag = "Heal" })
+
+                    if critBonus > 0 or zealHealBonus > 0 or healPowerBonus > 0 or healMulBonus > 0 then
+                        local parts = { string.format("Base %d", baseHeal) }
+                        if critBonus      > 0 then parts[#parts+1] = string.format("Crit +%d", critBonus) end
+                        if zealHealBonus  > 0 then parts[#parts+1] = string.format("Zeal +%d", zealHealBonus) end
+                        if healPowerBonus > 0 then parts[#parts+1] = string.format("HealPwr +%d", healPowerBonus) end
+                        if healMulBonus   > 0 then parts[#parts+1] = string.format("Heal%% +%d", healMulBonus) end
+                        RecordHealLog("done_" .. targetName, targetName,
+                            "  " .. table.concat(parts, " | "), 0.6, 0.85, 0.6,
+                            { logType = "heal", detailOnly = true })
+                    end
+
+                    -- Overheal line -- only when this heal spilled over the target's max HP.
+                    local oh = CONFIG._healOverheal
+                    if oh and oh.name == targetName and oh.over and oh.over > 0 then
+                        hd.overhealTotal = (hd.overhealTotal or 0) + oh.over
+                        local eff = math.max(0, absDmg - oh.over)
+                        local ohPctLine = absDmg > 0 and math.floor(oh.over / absDmg * 100) or 0
+                        RecordHealLog("done_" .. targetName, targetName,
+                            string.format("  Effective %d | Overheal %d (%d%%)", eff, oh.over, ohPctLine),
+                            0.55, 0.75, 0.95, { logType = "heal", detailOnly = true })
+                    end
+                else
+                    RecordHealLog("done_" .. targetName, targetName,
+                        string.format("+ %s -> %s: %d%s", skill, targetName, absDmg, hpSuffix),
+                        c[1], c[2], c[3],
+                        { logType = "heal", skill = skill, source = sourceName, target = targetName, damage = absDmg, dmgTag = "Heal" })
                 end
             elseif targetName == PLAYER_NAME then
-                RecordHealLog("recv_" .. sourceName, sourceName, string.format("+ %s from %s: %d", skill, sourceName, absDmg), c[1], c[2], c[3],
-                    { logType = "heal", skill = skill, source = sourceName, target = targetName, damage = absDmg })
+                local hText = string.format("+ %s from %s: %d", skill, sourceName, absDmg)
+                do  -- append your HP% on heals you receive
+                    local okH, h = pcall(function() return api.Unit:UnitHealth("player") end)
+                    local okM, m = pcall(function() return api.Unit:UnitMaxHealth("player") end)
+                    if okH and okM and h and m and m > 0 then hText = hText .. string.format(" [%d%%]", math.floor(h / m * 100)) end
+                end
+                RecordHealLog("recv_" .. sourceName, sourceName, hText, c[1], c[2], c[3],
+                    { logType = "heal", skill = skill, source = sourceName, target = targetName, damage = absDmg, dmgTag = "Heal" })
                 if inCombat then
                     if not healData.received[sourceName] then healData.received[sourceName] = { skills = {}, startTime = now, lastUpdate = now } end
                     healData.received[sourceName].skills[skill] = (healData.received[sourceName].skills[skill] or 0) + absDmg
@@ -2174,8 +4007,7 @@ local function OnLiveEvent(self, event, ...)
             if not inCombat then
                 inCombat = true
                 lastTargetBuffCount = -1  -- force buff effects re-scan on combat start
-                liveTitleLabel:SetText("Combat Log [COMBAT]")
-                if liveTitleLabel.style then liveTitleLabel.style:SetColor(1, 0, 0, 1) end
+                SetCombatStatus(true)
             end
             local outData = GetOrCreateOutgoing(unitID, targetName, now)
             outData.lastUpdate = now
@@ -2209,7 +4041,11 @@ local function OnLiveEvent(self, event, ...)
         local absorbed = 0
         local parseOk, parseResult = false, nil
         if _parseAvailable then
-            parseOk, parseResult = true, _parseCombatMessage(actionType, unpack(args, 5))
+            -- pcall-guarded: the game's parser throws on actionTypes it doesn't know
+            -- (e.g. ENVIRONMENTAL_DAMAGE). An unguarded throw aborts the whole handler
+            -- before the hit is even recorded -- which is why fall damage logged nothing.
+            parseOk, parseResult = pcall(_parseCombatMessage, actionType, unpack(args, 5))
+            if not parseOk then parseResult = nil end
         end
         if parseOk and parseResult then
             if parseResult.reduced then
@@ -2226,26 +4062,6 @@ local function OnLiveEvent(self, event, ...)
             end
         end
 
-        -- DEBUG: dump all ParseCombatMessage fields to file so we can see what the game reports
-        if CONFIG.DEBUG_PARSE and parseOk and parseResult and absDmg > 0 then
-            local dumpLines = {}
-            table.insert(dumpLines, string.format("-- act=%s src=%s tgt=%s skill=%s dmg=%d", actionType, sourceName, targetName, skill, absDmg))
-            local ok, err = pcall(function()
-                for k, v in pairs(parseResult) do
-                    table.insert(dumpLines, string.format("  %s = %s", tostring(k), tostring(v)))
-                end
-            end)
-            if not ok then table.insert(dumpLines, "  (pairs failed: " .. tostring(err) .. ")") end
-            -- Also dump raw args
-            for i, v in ipairs(args) do
-                table.insert(dumpLines, string.format("  args[%d] = %s", i, tostring(v)))
-            end
-            table.insert(dumpLines, "")
-            local ok2, existing = pcall(function() return api.File:Read("CombatLogPro/parse_dump.txt") end)
-            local prev = (ok2 and existing and existing ~= "") and (existing .. "\n") or ""
-            pcall(function() api.File:Write("CombatLogPro/parse_dump.txt", prev .. table.concat(dumpLines, "\n")) end)
-        end
-
         -- COMBAT: damage or CC from COMBAT_MSG also triggers combat (backup for game event)
         -- Player-initiated 0-damage actions are handled by UNIT_COMBAT_STATE_CHANGED
         local isCC = CC_DB[skill] ~= nil
@@ -2253,15 +4069,18 @@ local function OnLiveEvent(self, event, ...)
         local isCombatTrigger = (absDmg > 0) or isCC or isPlayerAction
         if not isCombatTrigger then return end
         if sourceName ~= PLAYER_NAME and targetName ~= PLAYER_NAME then return end
+        -- Falling/drowning shouldn't START a fight (otherwise it spams a 1s "fight" every time you
+        -- take fall damage out of combat). Only log it while ALREADY in combat -- a lethal
+        -- out-of-combat fall is still caught by the UNIT_DEAD death event.
+        if actionType == "ENVIRONMENTAL_DAMAGE" and not inCombat then return end
 
         timeSinceLastAction = 0
         if not inCombat then
             inCombat = true
-            liveTitleLabel:SetText("Combat Log [COMBAT]")
-            if liveTitleLabel.style then liveTitleLabel.style:SetColor(1, 0, 0, 1) end
+            SetCombatStatus(true)
         end
 
-        if sourceName == PLAYER_NAME then
+        if sourceName == PLAYER_NAME and actionType ~= "ENVIRONMENTAL_DAMAGE" then
             local outData = GetOrCreateOutgoing(unitID, targetName, now)
             outData.lastUpdate = now
 
@@ -2334,7 +4153,19 @@ local function OnLiveEvent(self, event, ...)
 
             if isCC then
                 local c = GetSafeColor(CONFIG.COL_CC)
-                RecordLogForTarget(unitID, targetName, string.format("%s (CC): Hit", skill), c[1], c[2], c[3],
+                -- A CC skill that ALSO deals damage (e.g. Dissonance) should still show its hit
+                -- number on the live line -- not just "Hit" (the damage was tallied for the summary
+                -- above either way). Pure-CC skills (no damage) keep the plain "(CC): Hit".
+                local ccTxt
+                if absDmg > 0 then
+                    local critTag = (string.find(upHit, "CRITICAL") ~= nil) and " Crit" or ""
+                    ccTxt = absorbed > 0
+                        and string.format("%s (CC): %d [%s]%s (%d absorbed)", skill, absDmg, dmgLabel, critTag, absorbed)
+                        or  string.format("%s (CC): %d [%s]%s", skill, absDmg, dmgLabel, critTag)
+                else
+                    ccTxt = string.format("%s (CC): Hit", skill)
+                end
+                RecordLogForTarget(unitID, targetName, ccTxt, c[1], c[2], c[3],
                     { logType = "cc", skill = skill, source = sourceName, target = targetName })
             elseif dotSkills[skill] then
                 local key = unitID .. "_" .. skill
@@ -2463,6 +4294,17 @@ local function OnLiveEvent(self, event, ...)
                 local dmgLine = absorbed > 0
                     and string.format("[%s] %d (%s|%d absorbed)", dmgLabel, absDmg, hitDisplay, absorbed)
                     or  string.format("[%s] %d (%s)", dmgLabel, absDmg, hitDisplay)
+                -- Append target HP% when the hit lands on the currently selected target
+                do
+                    local okN, tn = pcall(function() return api.Unit:UnitName("target") end)
+                    if okN and tn == targetName then
+                        local okH, h = pcall(function() return api.Unit:UnitHealth("target") end)
+                        local okM, m = pcall(function() return api.Unit:UnitMaxHealth("target") end)
+                        if okH and okM and h and m and m > 0 then
+                            dmgLine = dmgLine .. string.format(" [%d%%]", math.floor(h / m * 100))
+                        end
+                    end
+                end
                 -- Combo detection: build labels, log separately after damage line
                 local isSynergy = parseOk and parseResult and parseResult.synergy == true
                 local comboLabels = {}
@@ -2541,8 +4383,8 @@ local function OnLiveEvent(self, event, ...)
                 local sc = GetSafeColor(CONFIG.COL_SKILL_LABEL)
                 local cc = { 0.75, 0.5, 1 }  -- soft purple for combo lines
                 RecordLogForTarget(unitID, targetName, skillLine, sc[1], sc[2], sc[3],
-                    { logType = "outgoing", skill = skill, source = sourceName, target = targetName, damage = absDmg, absorbed = absorbed, hitType = hitType })
-                RecordLogForTarget(unitID, targetName, dmgLine, c[1], c[2], c[3], nil)
+                    { logType = "outgoing", skill = skill, source = sourceName, target = targetName, damage = absDmg, absorbed = absorbed, hitType = hitType, dmgTag = dmgTag })
+                RecordLogForTarget(unitID, targetName, dmgLine, c[1], c[2], c[3], { archiveHide = true })
                 if critExtra > 0 or zealBonus > 0 or chantyBonus > 0 or rhythmBonus > 0
                 or mcBonus > 0 or deliriumBonus > 0 or bbBonus > 0 or opBonus > 0
                 or assassinBonus > 0 or inspiredBonus > 0 then
@@ -2634,8 +4476,16 @@ local function OnLiveEvent(self, event, ...)
             -- Use sourceUnitId from COMBAT_TEXT (fires just before COMBAT_MSG) to
             -- distinguish same-named mobs in PvE. Falls back to name-only for PvP.
             local sourceUnitId = lastIncomingSourceId
-            local incomingKey = sourceUnitId and (sourceName .. "|" .. sourceUnitId) or sourceName
             lastIncomingSourceId = nil
+            -- Stable per-name key for the whole fight. COMBAT_TEXT (which carries the
+            -- unit id) doesn't fire on every hit, so without caching, a single mob whose
+            -- id is seen on only some hits splits into two sessions ("Mob|id" + "Mob").
+            if not fightData.incomingKeys then fightData.incomingKeys = {} end
+            local incomingKey = fightData.incomingKeys[sourceName]
+            if not incomingKey then
+                incomingKey = sourceUnitId and (sourceName .. "|" .. sourceUnitId) or sourceName
+                fightData.incomingKeys[sourceName] = incomingKey
+            end
             -- Check source's toughness to determine if this is a PvP hit (toughness only applies in PvP)
             local incSourceToughness = 0
             if sourceUnitId then
@@ -2674,6 +4524,9 @@ local function OnLiveEvent(self, event, ...)
             else
                 fightData.incoming[incomingKey].lastUpdate = now
             end
+            -- Sticky PvP flag: only players have toughness, so a source with battle_resist
+            -- means this was a PvP hit. Used to gate the toughness summary line (PvE = hide).
+            if incSourceToughness > 0 then fightData.incoming[incomingKey].isPvP = true end
             if absDmg > 0 then
                 -- Infer damage type for incoming hits using our own defense stats
                 local incSnap = fightData.incoming[incomingKey].defSnap
@@ -2716,7 +4569,12 @@ local function OnLiveEvent(self, event, ...)
                         end
                     end
                 end
-                if incIsMagic then
+                if actionType == "ENVIRONMENTAL_DAMAGE" then
+                    -- Falling/drowning ignores armor/dodge/parry -- keep it OUT of the physical
+                    -- mitigation breakdown so the summary doesn't show armor/dodge/modifiers for it.
+                    -- It still appears in the per-skill list + the Total line (both from data.skills).
+                    fightData.incoming[incomingKey].envDmg = (fightData.incoming[incomingKey].envDmg or 0) + absDmg
+                elseif incIsMagic then
                     fightData.incoming[incomingKey].magicDmg      = (fightData.incoming[incomingKey].magicDmg      or 0) + absDmg
                     fightData.incoming[incomingKey].magicAbsorbed = (fightData.incoming[incomingKey].magicAbsorbed  or 0) + absorbed
                     fightData.incoming[incomingKey].magicHits     = (fightData.incoming[incomingKey].magicHits      or 0) + 1
@@ -2748,24 +4606,50 @@ local function OnLiveEvent(self, event, ...)
                         end
                     end
                 end
+                -- Shield absorb attribution: if a player-cast shield is up and this hit was
+                -- (partly) absorbed, credit the shield. Approximate when multiple shields exist.
+                local shieldAnno = ""
+                if absorbed > 0 and bonuses.shieldName then
+                    local sn = bonuses.shieldName
+                    fightData.incoming[incomingKey].shieldAbsorbed = fightData.incoming[incomingKey].shieldAbsorbed or {}
+                    fightData.incoming[incomingKey].shieldAbsorbed[sn] = (fightData.incoming[incomingKey].shieldAbsorbed[sn] or 0) + absorbed
+                    shieldAnno = " [Shield: " .. sn .. "]"
+                end
                 local c = GetSafeColor(CONFIG.COL_INCOMING)
                 local incHitDisplay = string.find(tostring(hitType):upper(), "CRITICAL") and "Critical" or "HIT"
                 local sc = GetSafeColor(CONFIG.COL_SKILL_LABEL)
+                -- Incoming ancestral-variant icon: a same-named skill cast AT you -> read the debuff it
+                -- left on you to identify the caster's variant (best-effort; nil/base if none).
+                local incVarIcon = nil
+                if targetName == PLAYER_NAME and CONFIG._skillVariants[skill] then
+                    incVarIcon = CONFIG._incomingVariantIcon(skill)
+                end
                 RecordLogForTarget(incomingKey, sourceName,
                     string.format("< %s from %s", skill, sourceName),
                     sc[1], sc[2], sc[3],
-                    { logType = "incoming", skill = skill, source = sourceName, target = targetName, damage = absDmg, absorbed = absorbed, hitType = hitType })
+                    { logType = "incoming", skill = skill, source = sourceName, target = targetName, damage = absDmg, absorbed = absorbed, hitType = hitType, dmgTag = incTag, varIcon = incVarIcon })
                 local incLine = absorbed > 0
-                    and string.format("[%s] %d (%s|%d absorbed)%s", incLabel, absDmg, incHitDisplay, absorbed, bulwarkAnno)
-                    or  string.format("[%s] %d (%s)%s", incLabel, absDmg, incHitDisplay, bulwarkAnno)
+                    and string.format("[%s] %d (%s|%d absorbed)%s%s", incLabel, absDmg, incHitDisplay, absorbed, bulwarkAnno, shieldAnno)
+                    or  string.format("[%s] %d (%s)%s%s", incLabel, absDmg, incHitDisplay, bulwarkAnno, shieldAnno)
                 local incLineSimple = absorbed > 0
                     and string.format("[%s] %d (%s|%d absorbed)", incLabel, absDmg, incHitDisplay, absorbed)
                     or  string.format("[%s] %d (%s)", incLabel, absDmg, incHitDisplay)
+                -- Append your HP% to incoming hits
+                do
+                    local okH, h = pcall(function() return api.Unit:UnitHealth("player") end)
+                    local okM, m = pcall(function() return api.Unit:UnitMaxHealth("player") end)
+                    if okH and okM and h and m and m > 0 then
+                        local hpS = string.format(" [%d%%]", math.floor(h / m * 100))
+                        incLine = incLine .. hpS
+                        incLineSimple = incLineSimple .. hpS
+                    end
+                end
                 local incMeta = incLine ~= incLineSimple and { liveText = incLineSimple } or nil
                 RecordLogForTarget(incomingKey, sourceName, incLine, c[1], c[2], c[3], incMeta)
                 -- Incoming mitigation breakdown: reverse the full reduction chain
-                -- Chain: raw → toughness → armor/resist → % reduction → flat reduction = absDmg
-                do
+                -- Chain: raw → toughness → armor/resist → % reduction → flat reduction = absDmg.
+                -- Skipped for falling/drowning -- environmental damage ignores armor/DR/toughness.
+                if actionType ~= "ENVIRONMENTAL_DAMAGE" then
                     local playerDef  = incIsMagic and currentMagicResist or currentArmor
                     local incPctMul  = incIsMagic and incDmgStats.spellMul  or (incIsRanged and incDmgStats.rangedMul or incDmgStats.meleeMul)
                     local incFlatVal = incIsMagic and incDmgStats.spellVal   or (incIsRanged and incDmgStats.rangedVal or incDmgStats.meleeVal)
@@ -2808,22 +4692,47 @@ local function OnLiveEvent(self, event, ...)
         end
 
     elseif event == "UNIT_COMBAT_STATE_CHANGED" then
-        if CONFIG.DEBUG_LOG_EVENTS then
-            LogEventToFile(event, args)
-        end
         -- args[1] = boolean (true=entering, false=leaving), args[2] = unitId (string)
         local enteringCombat = args[1]
         local unitId = tostring(args[2] or "")
         local playerId = tostring(api.Unit:GetUnitId("player") or "")
+        -- A mob you damaged LEAVING combat = it died (proven via probe: mobs fire entering=false
+        -- on death; UNIT_DEAD never fires for them). Catches NON-targeted deaths (AoE/DoT) the HP
+        -- poll can't see. Keyed by unit id so several same-named mobs each register. The TIGHT
+        -- recent-hit gate distinguishes a KILL (left combat <1.5s after your killing blow) from a
+        -- LEASH (you fled -> the mob gives up SECONDS after your last hit): a stale last-hit means
+        -- you disengaged, not killed it. Players win via UNIT_DEAD (deduped by id).
+        if enteringCombat == false and unitId ~= playerId and unitId ~= "" then
+            local od = fightData.outgoing[unitId]
+            if od and od.name and (frameNow - (od.lastUpdate or 0) < 1500) then
+                CONFIG._deathLogged = CONFIG._deathLogged or {}
+                if not CONFIG._deathLogged[unitId] then
+                    fightData.killedNames = fightData.killedNames or {}; fightData.killedNames[od.name] = true
+                    local ks, kr = "", CONFIG._lastDmgSrc and CONFIG._lastDmgSrc[unitId]
+                    if kr and kr ~= "" and kr ~= od.name then ks = (kr == PLAYER_NAME) and "  (your kill)" or ("  (killed by " .. kr .. ")") end
+                    CONFIG._killGrace = CONFIG._killGrace or {}
+                    if not CONFIG._killGrace[unitId] then CONFIG._killGrace[unitId] = { t = frameNow, ks = ks, name = od.name } end
+                end
+            end
+        end
+        -- Spectator / raid-log mode (opt-in): a NEARBY unit entering combat opens a fight even when
+        -- you never participate. The gap-timeout (kept alive by recorded nearby events) closes + saves
+        -- it once nearby combat stops.
+        if CONFIG.SPECTATE and enteringCombat == true and unitId ~= playerId and unitId ~= "" and not inCombat then
+            inCombat = true
+            timeSinceLastAction = 0
+            SetCombatStatus(true)
+        end
         if unitId == playerId then
             if enteringCombat == true then
+                CONFIG._gameInCombat = true  -- runtime flag (not a setting): the game's combat state
                 if not inCombat then
                     inCombat = true
                     timeSinceLastAction = 0
-                    liveTitleLabel:SetText("Combat Log [COMBAT]")
-                    if liveTitleLabel.style then liveTitleLabel.style:SetColor(1, 0, 0, 1) end
+                    SetCombatStatus(true)
                 end
             else
+                CONFIG._gameInCombat = false
                 -- Game says combat ended - give DOT_WAIT room for trailing DoT ticks
                 -- before FinishFight closes the session.
                 if inCombat then
@@ -2835,6 +4744,93 @@ local function OnLiveEvent(self, event, ...)
         end
 
     elseif event == "TARGET_CHANGED" then
+        -- Cache the current target's name so the recap can read its HP% via the "target" handle
+        -- (the only way to read an enemy's health -- they have no team tag).
+        do
+            local okTN, tName = pcall(function() return api.Unit:UnitName("target") end)
+            CONFIG._curTargetName = (okTN and tName and tName ~= "") and tName or nil
+        end
+        -- Cache the targeted unit's gear score by name. UnitGearScore only works for your CURRENT
+        -- target (the deep stats are nil for arbitrary feed units, proven via probe) and reads 0 for
+        -- mobs -- so we opportunistically stash a real (>0) score whenever you target a player, and
+        -- surface it in that unit's history view.
+        if CONFIG._curTargetName then
+            local tln = string.lower(CONFIG._curTargetName)
+            -- Gear score / faction name / force-PvP are PLAYER-only stats (mobs read 0/nothing,
+            -- gathering nodes aren't characters at all). The old code fired all three native unit
+            -- queries on EVERY target change -- which storms the engine when you churn targets fast
+            -- (harvesting a farm flips through hundreds of nodes a minute), and pcall can't catch a
+            -- native access violation. Gate them: resolve a name AT MOST ONCE, and only after a cheap
+            -- class check confirms the target is a character (player). Non-players cost one
+            -- GetUnitClassName call on first sight, then nothing. Players keep retrying until gear
+            -- score loads (it's async).
+            CONFIG._nameSeen = CONFIG._nameSeen or {}
+            if not CONFIG._nameSeen[tln] then
+                local isChar = false
+                -- Post-2026-06-18 lockdown: GetUnitInfoById(targetId) returns nil, so the old
+                -- info.type=="character" probe ALWAYS failed -- faction/force/gear-score were never
+                -- cached and faction colour + the bloodlust mark broke for every target. GetUnitClassName
+                -- still works as a token read: a real class name for players, "Pending" for mobs /
+                -- gathering nodes -- so it's the post-lockdown "is this a character?" signal.
+                local okCN, cn = pcall(function() return api.Ability:GetUnitClassName("target") end)
+                if okCN and cn and cn ~= "" and tostring(cn) ~= "Pending" then isChar = true end
+                if isChar then
+                    local okG, g = pcall(function() return api.Unit:UnitGearScore("target") end)
+                    local gs = okG and tonumber(g) or nil
+                    if gs and gs > 0 then CONFIG._nameGS = CONFIG._nameGS or {}; CONFIG._nameGS[tln] = gs end
+                    local okF, fn = pcall(function() return api.Unit:GetFactionName("target") end)
+                    if okF and fn and fn ~= "" then CONFIG._nameFaction = CONFIG._nameFaction or {}; CONFIG._nameFaction[tln] = tostring(fn) end
+                    local okA, fa = pcall(function() return api.Unit:UnitIsForceAttack("target") end)
+                    if okA then CONFIG._nameForce = CONFIG._nameForce or {}; CONFIG._nameForce[tln] = fa and true or false end
+                    if CONFIG._nameGS and CONFIG._nameGS[tln] then CONFIG._nameSeen[tln] = true end  -- gear score landed; stop
+                else
+                    CONFIG._nameSeen[tln] = true   -- non-character (mob / gathering node / mount): never re-probe
+                end
+            end
+        end
+        -- TEMP probe: dump EACH distinct target's UnitInfo (and the player once) so we can compare
+        -- mounts vs players vs mobs and find a reliable "is a mount" signal. Target several things.
+        if CONFIG.DEBUG_UNITINFO then
+            local okTN, tName = pcall(function() return api.Unit:UnitName("target") end)
+            local nm = (okTN and tName) or nil
+            CONFIG._dumpedTargets = CONFIG._dumpedTargets or {}
+            if nm and not CONFIG._dumpedTargets[nm] then
+                CONFIG._dumpedTargets[nm] = true
+                local lines = {}
+                local function dumpUI(label, tbl)
+                    lines[#lines + 1] = "=== " .. label .. " ==="
+                    if type(tbl) == "table" then
+                        for k, v in pairs(tbl) do lines[#lines + 1] = "  " .. tostring(k) .. " = " .. tostring(v) end
+                    end
+                end
+                if not CONFIG._dumpedPlayer then
+                    CONFIG._dumpedPlayer = true
+                    pcall(function() api.File:Write("CombatLogPro/unitinfo_dump.txt", "") end)  -- fresh file
+                    local okP, pInfo = pcall(function() return api.Unit:UnitInfo("player") end)
+                    dumpUI("PLAYER (you)", okP and pInfo or nil)
+                end
+                local okT, tInfo = pcall(function() return api.Unit:UnitInfo("target") end)
+                dumpUI("TARGET = " .. nm, okT and tInfo or nil)
+                -- CLASS source (separate from UnitInfo) + skillset decode -- this is what tags a
+                -- ridden mount as a "player", so capture what it returns for mounts vs real players.
+                local okCN, cn = pcall(function() return api.Ability:GetUnitClassName("target") end)
+                local okUC, uc = pcall(function() return api.Unit:UnitClass("target") end)
+                lines[#lines + 1] = "  [GetUnitClassName] = " .. tostring((okCN and cn) or "nil")
+                lines[#lines + 1] = "  [UnitClass] = " .. tostring((okUC and uc) or "nil")
+                if type(tInfo) == "table" then
+                    for k, v in pairs(tInfo) do
+                        local n = tonumber(v)
+                        if n and n > 0 and n < 100 then
+                            local okS, sn = pcall(function() return api.Ability:GetSkillsetNameById(n) end)
+                            if okS and sn and sn ~= "" then lines[#lines + 1] = "  [skillset] " .. tostring(k) .. "=" .. n .. " -> " .. tostring(sn) end
+                        end
+                    end
+                end
+                local okR, ex = pcall(function() return api.File:Read("CombatLogPro/unitinfo_dump.txt") end)
+                local prev = (okR and ex and ex ~= "") and (tostring(ex) .. "\n") or ""
+                pcall(function() api.File:Write("CombatLogPro/unitinfo_dump.txt", prev .. table.concat(lines, "\n")) end)
+            end
+        end
         -- patch 243+: instant target update instead of waiting for 200ms scan tick
         local currentTgtID = api.Unit:GetUnitId("target")
         if currentTgtID ~= lastTargetID then
@@ -2848,43 +4844,50 @@ local function OnLiveEvent(self, event, ...)
 
     elseif event == "SPELLCAST_SUCCEEDED" then
         -- patch 243+: fires when a cast-time skill completes (before the COMBAT_MSG damage event).
-        if CONFIG.DEBUG_LOG_EVENTS then
-            LogEventToFile(event, args)
-        end
         -- Attempt to cache the skill name (arg layout TBD; try common positions)
         local castSkill = tostring(args[2] or args[1] or "")
         if castSkill ~= "" and castSkill ~= "0" then
             lastPlayerCast = castSkill
         end
         currentCast = nil  -- cast finished, clear in-progress state
+        -- A pending Revive reaching SUCCEEDED = a completed revive (success fires SUCCEEDED, an
+        -- interrupt fires STOP -- mutually exclusive, confirmed via probe). Log it + bump the
+        -- running session count. Freshness guard ignores a stale pending (e.g. a missed STOP) so a
+        -- later unrelated cast can't claim it.
+        if CONFIG._pendingRevive and (api.Time:GetUiMsec() - (CONFIG._pendingRevive.t or 0)) < 8000 then
+            local rv = CONFIG._pendingRevive
+            CONFIG._fightReviveCount = (CONFIG._fightReviveCount or 0) + 1
+            local tgt = (rv.target and rv.target ~= "") and rv.target or "an ally"
+            LogEntry(string.format("+ %s -> %s  [revive #%d]", rv.skill, tgt, CONFIG._fightReviveCount),
+                0.4, 1, 0.7, { skill = rv.skill })
+        end
+        CONFIG._pendingRevive = nil
 
     elseif event == "SPELLCAST_START" then
         -- patch 243+: fires when the player begins casting a cast-time skill.
         -- arg[1]=skill name, arg[2]=cast time ms, arg[3]="player", arg[4]=false
-        if CONFIG.DEBUG_LOG_EVENTS then
-            LogEventToFile(event, args)
-        end
         local castSkill = tostring(args[1] or "")
         if castSkill ~= "" and castSkill ~= "0" then
             currentCast = castSkill
             lastPlayerCast = castSkill  -- cache here since SUCCEEDED only returns "player"
+            -- Single-target Revive tracking: capture the revivee NOW (your target at cast START --
+            -- Revive can't be cast without a dead ally selected, and you may re-target mid-cast).
+            -- Finalised on SUCCEEDED, discarded on STOP (interrupt). Defy Death / AoE NOT tracked.
+            if string.match(string.lower(castSkill), "^revive") then
+                CONFIG._pendingRevive = { skill = castSkill, target = CONFIG._curTargetName, t = api.Time:GetUiMsec() }
+            end
         end
 
     elseif event == "SPELLCAST_STOP" then
-        -- patch 243+: fires when a cast ends (both success and interrupt).
-        -- Cannot reliably distinguish from SPELLCAST_SUCCEEDED here, so just clear state.
-        if CONFIG.DEBUG_LOG_EVENTS then
-            LogEventToFile(event, args)
-        end
+        -- patch 243+: fires when a cast ends. Per the revive probe, a SUCCESSFUL cast fires only
+        -- SUCCEEDED and an interrupt fires only STOP -- so STOP here means the cast was interrupted.
         currentCast = nil
         lastPlayerCast = nil
+        CONFIG._pendingRevive = nil   -- interrupted -> no revive happened, don't count it
 
     elseif event == "TARGET_TO_TARGET_CHANGED" then
         -- patch 243+: fires when what your target is targeting changes.
         -- Update the live targeting flag used at fight-start snapshot time.
-        if CONFIG.DEBUG_LOG_EVENTS then
-            LogEventToFile(event, args)
-        end
         local okTU, targeting = pcall(function()
             return api.Unit:TargetUnit("target")
         end)
@@ -2967,6 +4970,57 @@ local function OnLiveUpdate(self, dt)
             lastTargetBuffCount = -1  -- force buff effects re-scan on next tick
         end
         if inCombat then ScanUnitDebuffs("player"); ScanUnitDebuffs("target") end
+
+        -- Player absorb-shield tracking (Insulating Lens, etc.). These carry a pool that depletes
+        -- as it soaks hits but fires NO combat event. The live remaining is the buff instance's
+        -- `stack` field (proven via probe: stack ticks 2049->... while the by-id tooltip stays
+        -- frozen at max). On buff-set change, identify the shield by its "absorbs ... damage"
+        -- tooltip (one scan); each tick, read its `stack` and bank every drop into "Shields
+        -- absorbed". State on CONFIG (no main-chunk locals). NB: `stack` means remaining pool
+        -- ONLY for the identified shield -- for other buffs it's an ordinary stack count.
+        if inCombat then do
+            local pbc = api.Unit:UnitBuffCount("player") or 0
+            if pbc ~= (CONFIG._pbCount or -1) then
+                CONFIG._pbCount = pbc
+                local sid, sname
+                for i = 1, pbc do
+                    local b = api.Unit:UnitBuff("player", i)
+                    if b and b.buff_id then
+                        local tt = api.Ability:GetBuffTooltip(b.buff_id)
+                        local d = string.lower(tt and (tt.desc or tt.description or tt.text or tt.info) or "")
+                        if string.find(d, "absorbs") and string.find(d, "damage") then
+                            sid = b.buff_id; sname = (tt and tt.name) or "Shield"; break
+                        end
+                    end
+                end
+                if sid then
+                    if not (CONFIG._poolShield and CONFIG._poolShield.id == sid) then
+                        CONFIG._poolShield = { id = sid, name = sname }
+                    end
+                else
+                    CONFIG._poolShield = nil
+                end
+            end
+            local ps = CONFIG._poolShield
+            if ps and ps.id then
+                local rem
+                for i = 1, pbc do
+                    local b = api.Unit:UnitBuff("player", i)
+                    if b and b.buff_id == ps.id then rem = tonumber(b.stack); break end
+                end
+                if rem then
+                    if ps.last == nil then
+                        ps.last = rem
+                    elseif rem < ps.last then
+                        CONFIG._shieldAbsorb = CONFIG._shieldAbsorb or {}
+                        CONFIG._shieldAbsorb[ps.name] = (CONFIG._shieldAbsorb[ps.name] or 0) + (ps.last - rem)
+                        ps.last = rem
+                    elseif rem > ps.last then
+                        ps.last = rem  -- recast/refresh
+                    end
+                end
+            end
+        end end
 
         -- Scan target buffs for combat-affecting effects (invincibility, spell shield, runes)
         -- Target buff effects scan (invincibility, spell shield, rune, damage shield).
@@ -3064,6 +5118,7 @@ local function OnLiveUpdate(self, dt)
             bonuses.battleFocusActive    = false
             bonuses.intensifiedHarmActive = false
             bonuses.inspiredStacks       = 0
+            bonuses.shieldName           = nil
             local bc = api.Unit:UnitBuffCount("player") or 0
             local newStackCache = {}
             for i = 1, bc do
@@ -3094,6 +5149,12 @@ local function OnLiveUpdate(self, dt)
                     if bid == 971 or bid == 7559 then bonuses.intensifiedHarmActive = true end
                     -- Inspired (Auramancy): +52%/stack to Vicious Implosion
                     if bid == 127 then bonuses.inspiredStacks = bstacks end
+                    -- Duel ("mock fight"): the Duel buff is present throughout the duel -> tag the fight
+                    -- so its sidebar row gets the duel icon (id 1834/3649 from static_buff_list).
+                    if bid == 1834 or bid == 3649 then CONFIG._fightWasDuel = true end
+                    -- Damage-absorb shields on the player (for absorb attribution)
+                    if bid == 11273 then bonuses.shieldName = "Omnipotent Ward"
+                    elseif bid == 15078 then bonuses.shieldName = "Deliverance Shield" end
                     -- Name resolution (needed for duel-end check and stack cache)
                     local bname = buffDB[b.buff_id] or buffNameCache[b.buff_id]
                     if not bname then
@@ -3107,8 +5168,9 @@ local function OnLiveUpdate(self, dt)
                         if string.find(string.lower(bname), "bulwark ballad") then bulwarkActive = true end
                         -- Populate stack cache (used by GetPlayerBuffStacks in combat handler)
                         newStackCache[bname] = math.max(1, tonumber(b.stack or b.count or 1))
-                        -- Duel-end check
+                        -- Duel-end check (a mock-fight-end buff also confirms this WAS a duel)
                         if inCombat and DUEL_END_BUFF_NAMES[string.lower(bname)] then
+                            CONFIG._fightWasDuel = true
                             playerBuffStackCache = newStackCache
                             FinishFight()
                             break
@@ -3137,6 +5199,12 @@ local function OnLiveUpdate(self, dt)
                 else
                     bonuses.magicCircleDpsBonus = 0
                 end
+                -- Heal-power buff tracking: heal_dps = flat healing power (parallels spell_dps;
+                -- raised by Rhythm/Ode); heal_mul = % heal bonus. Baseline captured out of
+                -- combat (gear-only) so the in-combat delta is the buff contribution.
+                bonuses.healDps = tonumber(pInfoScan.heal_dps or 0)
+                bonuses.healMul = tonumber(pInfoScan.heal_mul or 0)
+                if not inCombat then bonuses.baseHealDps = bonuses.healDps end
                 incDmgStats.spellMul  = tonumber(pInfoScan.incoming_spell_damage_mul  or 0)
                 incDmgStats.meleeMul  = tonumber(pInfoScan.incoming_melee_damage_mul  or 0)
                 incDmgStats.rangedMul = tonumber(pInfoScan.incoming_ranged_damage_mul or 0)
@@ -3223,140 +5291,62 @@ local function OnLiveUpdate(self, dt)
             end
         end
 
-        -- Continuous target buff/debuff scanner
-        if CONFIG.SCAN_TARGET_BUFFS then
-            -- Load previously logged buff IDs from file on first run
-            if not buffScanLoaded then
-                buffScanLoaded = true
-                local ok, existing = pcall(function() return api.File:Read(buffScanFile) end)
-                if ok and existing then
-                    for id in string.gmatch(existing, "%[(%d+)%]") do
-                        seenBuffIds[tonumber(id)] = true
-                    end
-                end
-            end
-
-            local tgtId = api.Unit:GetUnitId("target")
-            if tgtId and tgtId ~= "0" then
-                local newEntries = {}
-                local tgtName = api.Unit:GetUnitNameById(tgtId) or "Unknown"
-
-                -- Scan buffs
-                local buffCount = api.Unit:UnitBuffCount("target") or 0
-                for i = 1, buffCount do
-                    local b = api.Unit:UnitBuff("target", i)
-                    if b and b.buff_id and not seenBuffIds[b.buff_id] then
-                        seenBuffIds[b.buff_id] = true
-                        local tooltip = api.Ability:GetBuffTooltip(b.buff_id)
-                        local name = (tooltip and tooltip.name) or "Unknown"
-                        local desc = tooltip and (tooltip.desc or tooltip.description or tooltip.text or tooltip.info) or ""
-                        if desc then
-                            desc = string.gsub(desc, "\r", "")
-                            desc = string.gsub(desc, "\n", " ")
-                        end
-                        table.insert(newEntries, string.format("[BUFF] [%d] %s (on %s): %s", b.buff_id, name, tgtName, desc))
-                    end
-                end
-
-                -- Scan debuffs
-                local debuffCount = api.Unit:UnitDeBuffCount("target") or 0
-                for i = 1, debuffCount do
-                    local d = api.Unit:UnitDeBuff("target", i)
-                    if d and d.buff_id and not seenBuffIds[d.buff_id] then
-                        seenBuffIds[d.buff_id] = true
-                        local tooltip = api.Ability:GetBuffTooltip(d.buff_id)
-                        local name = (tooltip and tooltip.name) or "Unknown"
-                        local desc = tooltip and (tooltip.desc or tooltip.description or tooltip.text or tooltip.info) or ""
-                        if desc then
-                            desc = string.gsub(desc, "\r", "")
-                            desc = string.gsub(desc, "\n", " ")
-                        end
-                        table.insert(newEntries, string.format("[DEBUFF] [%d] %s (on %s): %s", d.buff_id, name, tgtName, desc))
-                    end
-                end
-
-                -- Append new entries to file
-                if #newEntries > 0 then
-                    local prev = ""
-                    local ok, existing = pcall(function() return api.File:Read(buffScanFile) end)
-                    if ok and existing then prev = existing end
-                    local append = table.concat(newEntries, "\n")
-                    if prev ~= "" then append = prev .. "\n" .. append end
-                    pcall(function() api.File:Write(buffScanFile, append) end)
-                    LogEntry(string.format("[Buff Scan] +%d new entries written", #newEntries), 0.5, 0.8, 1)
-                end
-            end
-        end
-
-        -- Continuous player buff/debuff scanner
-        if CONFIG.SCAN_PLAYER_BUFFS then
-            if not playerBuffScanLoaded then
-                playerBuffScanLoaded = true
-                local ok, existing = pcall(function() return api.File:Read(playerBuffScanFile) end)
-                if ok and existing then
-                    for id in string.gmatch(existing, "%[(%d+)%]") do
-                        seenPlayerBuffIds[tonumber(id)] = true
-                    end
-                end
-            end
-
-            local newEntries = {}
-
-            local buffCount = api.Unit:UnitBuffCount("player") or 0
-            for i = 1, buffCount do
-                local b = api.Unit:UnitBuff("player", i)
-                if b and b.buff_id and not seenPlayerBuffIds[b.buff_id] then
-                    seenPlayerBuffIds[b.buff_id] = true
-                    local tooltip = api.Ability:GetBuffTooltip(b.buff_id)
-                    local name = (tooltip and tooltip.name) or "Unknown"
-                    local desc = tooltip and (tooltip.desc or tooltip.description or tooltip.text or tooltip.info) or ""
-                    if desc then
-                        desc = string.gsub(desc, "\r", "")
-                        desc = string.gsub(desc, "\n", " ")
-                    end
-                    table.insert(newEntries, string.format("[BUFF] [%d] %s: %s", b.buff_id, name, desc))
-                end
-            end
-
-            local debuffCount = api.Unit:UnitDeBuffCount("player") or 0
-            for i = 1, debuffCount do
-                local d = api.Unit:UnitDeBuff("player", i)
-                if d and d.buff_id and not seenPlayerBuffIds[d.buff_id] then
-                    seenPlayerBuffIds[d.buff_id] = true
-                    local tooltip = api.Ability:GetBuffTooltip(d.buff_id)
-                    local name = (tooltip and tooltip.name) or "Unknown"
-                    local desc = tooltip and (tooltip.desc or tooltip.description or tooltip.text or tooltip.info) or ""
-                    if desc then
-                        desc = string.gsub(desc, "\r", "")
-                        desc = string.gsub(desc, "\n", " ")
-                    end
-                    table.insert(newEntries, string.format("[DEBUFF] [%d] %s: %s", d.buff_id, name, desc))
-                end
-            end
-
-            if #newEntries > 0 then
-                local prev = ""
-                local ok, existing = pcall(function() return api.File:Read(playerBuffScanFile) end)
-                if ok and existing then prev = existing end
-                local append = table.concat(newEntries, "\n")
-                if prev ~= "" then append = prev .. "\n" .. append end
-                pcall(function() api.File:Write(playerBuffScanFile, append) end)
-                LogEntry(string.format("[Player Scan] +%d new entries written", #newEntries), 0.5, 1, 0.5)
-            end
-        end
-
     end
     
     if inCombat then
+        -- Player death: absolute HP at 0 means dead, from ANY source (hits, DoT, fall,
+        -- drown, environmental) -- layout-independent and unambiguous. Log once; the
+        -- timeout below is then forced to 0 so the session closes + saves immediately.
+        -- Player death via HP poll (backup to UNIT_DEAD). Hardened against the "YOU DIED" spam:
+        --   * the latch is the log-dedup -- cleared ONLY when HP recovers (>0), never by FinishFight,
+        --     so a corpse still flagged in-combat (DoTs/AoE, or a probe-lagged frame) can't re-fire
+        --     the death line every fight-close cycle.
+        --   * require an actual number AND HP<=0 on two reads -- a single failed/transient 0 read
+        --     while alive must not declare death (mirrors the target-death guard above).
+        do
+            local okPD, pdh = pcall(function() return api.Unit:UnitHealth("player") end)
+            if okPD and type(pdh) == "number" then
+                if pdh > 0 then
+                    CONFIG._playerDeadLatch = false       -- alive -> re-arm for the next death
+                    CONFIG._playerZeroCount = 0
+                else
+                    CONFIG._playerZeroCount = (CONFIG._playerZeroCount or 0) + 1
+                    if CONFIG._playerZeroCount >= 2 and not CONFIG._playerDeadLatch then
+                        CONFIG._playerDeadLatch = true
+                        CONFIG._playerDied = true
+                        CONFIG._gameInCombat = false
+                        LogEntry("YOU DIED", 1, 0.2, 0.2, { death = true })
+                    end
+                end
+            end
+        end
         timeSinceLastAction = timeSinceLastAction + elapsed
-        local currentTimeoutLimit = CONFIG.COMBAT_WAIT 
+        local currentTimeoutLimit = CONFIG.COMBAT_WAIT
         local tId = api.Unit:GetUnitId("target")
         local targetDead = false
 
-        local hp = api.Unit:UnitHealth("target")
-        if tId and tId ~= "0" and (not hp or hp <= 0) then targetDead = true end
+        local okHp, hp = pcall(function() return api.Unit:UnitHealth("target") end)
+        -- Only treat as dead when we actually READ a number <= 0. A failed/nil read must
+        -- NOT count as death -- that was prematurely shortening the close timeout to 2s
+        -- mid-fight (a cause of one fight splitting into several saved sessions).
+        if okHp and tId and tId ~= "0" and type(hp) == "number" and hp <= 0 then targetDead = true end
 
+        if not targetDead then CONFIG._targetDeadLogged = false end
         if targetDead then
+             -- UNIT_DEAD fires for the player + other PLAYERS, but NOT for mobs (NPCs). So the
+             -- HP poll is the only death source for mob kills. Record a DEFERRED pending kill;
+             -- the flush below logs it only if UNIT_DEAD hasn't already -- players win via the
+             -- real event, mobs (no event) get their death line from the poll, with attribution.
+             if not CONFIG._targetDeadLogged and fightData.outgoing[tId] then
+                 CONFIG._targetDeadLogged = true
+                 local okTN, tn = pcall(function() return api.Unit:UnitName("target") end)
+                 local nm = (okTN and tn) or (fightData.outgoing[tId] and fightData.outgoing[tId].name) or "Target"
+                 fightData.killedNames = fightData.killedNames or {}; fightData.killedNames[nm] = true
+                 local ks, kr = "", CONFIG._lastDmgSrc and CONFIG._lastDmgSrc[tId]
+                 if kr and kr ~= "" and kr ~= nm then ks = (kr == PLAYER_NAME) and "  (your kill)" or ("  (killed by " .. kr .. ")") end
+                 CONFIG._killGrace = CONFIG._killGrace or {}
+                 if not CONFIG._killGrace[tId] then CONFIG._killGrace[tId] = { t = now, ks = ks, name = nm } end
+             end
              -- Only shorten timeout if no other active outgoing targets
              local hasOtherTargets = false
              for id, _ in pairs(fightData.outgoing) do
@@ -3364,13 +5354,38 @@ local function OnLiveUpdate(self, dt)
              end
              currentTimeoutLimit = hasOtherTargets and CONFIG.COMBAT_WAIT or 2000
         elseif tId and activeCCSessions[tId] and (function(t) for _ in pairs(t) do return true end return false end)(activeCCSessions[tId]) then
-             currentTimeoutLimit = 10000 
+             currentTimeoutLimit = 10000
              for buffName, startTime in pairs(activeCCSessions[tId]) do
                  if (now - startTime) > 45000 then activeCCSessions[tId][buffName] = nil end
              end
         end
 
-        if timeSinceLastAction >= currentTimeoutLimit then FinishFight() end
+        -- Flush deferred kills: after a short grace, log a pending kill ONLY if UNIT_DEAD didn't
+        -- already claim it. Players are logged instantly by UNIT_DEAD (skipped here); mobs (no
+        -- UNIT_DEAD) get their death line here. Keyed by UNIT ID so several same-named mobs each
+        -- register (the death line still shows the name).
+        if CONFIG._killGrace then
+            CONFIG._deathLogged = CONFIG._deathLogged or {}
+            for id, info in pairs(CONFIG._killGrace) do
+                if now - info.t >= 400 then
+                    if not CONFIG._deathLogged[id] then
+                        CONFIG._deathLogged[id] = true
+                        LogEntry((info.name or "?") .. " DIED" .. (info.ks or ""), 1, 0.5, 0.2, { death = true })
+                    end
+                    CONFIG._killGrace[id] = nil
+                end
+            end
+        end
+
+        -- While the game still reports the player in combat, don't close on the normal
+        -- action-gap timeout — long fights have lulls. Only this generous safety net can
+        -- close it then (covers a missed "left combat" event). Tunable.
+        if CONFIG._gameInCombat then currentTimeoutLimit = math.max(currentTimeoutLimit, 30000) end
+        if CONFIG._playerDied then currentTimeoutLimit = 0 end  -- your death ends the fight now
+
+        if timeSinceLastAction >= currentTimeoutLimit then
+            FinishFight()
+        end
     end
 
     for key, data in pairs(activeDots) do
@@ -3388,7 +5403,7 @@ end
 
 local function CreateOptionsWindow()
     wOptions = api.Interface:CreateEmptyWindow("OpWin", "UIParent")
-    wOptions:Show(false); wOptions:SetExtent(380, 700); wOptions:AddAnchor("CENTER", "UIParent", 0, 0); MakeDraggable(wOptions, wOptions)
+    wOptions:Show(false); wOptions:SetExtent(380, 1000); wOptions:AddAnchor("CENTER", "UIParent", 0, 0); MakeDraggable(wOptions, wOptions)
     
     CreateBackdrop(wOptions, {0.05, 0.05, 0.05, 0.95})
     
@@ -3400,180 +5415,887 @@ local function CreateOptionsWindow()
     opTitle:SetText("CLP Configuration"); opTitle:AddAnchor("CENTER", opTitleBar, 0, 0)
     if opTitle.style then opTitle.style:SetFontSize(16) end; MakeDraggable(opTitleBar, wOptions)
 
-    -- === SECTION 1: WINDOW SIZE ===
-    local lblSec1 = wOptions:CreateChildWidget("label", "Sec1", 0, true)
-    lblSec1:SetText("Window Size")
-    lblSec1:AddAnchor("TOP", wOptions, 0, 45)
-    if lblSec1.style then lblSec1.style:SetColor(0.5, 0.8, 1, 1); lblSec1.style:SetAlign(ALIGN.CENTER) end
+    -- Boxed-toggle layout matching the history filter bar; a running Y cursor keeps spacing
+    -- consistent (no hardcoded offsets that can collide). Two columns at LX / RX.
+    local uid = 0
+    local y = 40
+    local LX, RX, CW, FULLW = 14, 196, 170, 352
+    local function nid() uid = uid + 1; return tostring(uid) end
+    local function section(title)
+        y = y + 4
+        local ln = wOptions:CreateColorDrawable(0.28, 0.28, 0.32, 1, "overlay")
+        ln:AddAnchor("TOPLEFT", wOptions, LX, y); ln:SetExtent(FULLW, 1)
+        local l = wOptions:CreateChildWidget("label", "sc" .. nid(), 0, true)
+        l:SetText(title); l:SetExtent(FULLW, 18); l:AddAnchor("TOPLEFT", wOptions, LX, y + 4)
+        if l.style then l.style:SetColor(0.5, 0.8, 1, 1); l.style:SetAlign(ALIGN.LEFT); l.style:SetFontSize(13) end
+        y = y + 26
+    end
+    -- Boxed toggle (green ON / gray OFF). persist -> SaveSettings; after() runs post-toggle. No y advance.
+    local function toggle(field, label, x, w, persist, after)
+        local b = wOptions:CreateChildWidget("button", "tg" .. nid(), 0, true)
+        b:SetExtent(w, 22); b:AddAnchor("TOPLEFT", wOptions, x, y)
+        local bg = b:CreateColorDrawable(0, 0, 0, 1, "background")
+        bg:AddAnchor("TOPLEFT", b, 0, 0); bg:AddAnchor("BOTTOMRIGHT", b, 0, 0)
+        if b.style then b.style:SetAlign(ALIGN.CENTER); b.style:SetFontSize(12) end
+        local function refresh()
+            if CONFIG[field] ~= false then bg:SetColor(0.15, 0.33, 0.18, 1); b:SetTextColor(0.8, 1, 0.8, 1)
+            else bg:SetColor(0.16, 0.16, 0.16, 1); b:SetTextColor(0.55, 0.55, 0.55, 1) end
+        end
+        b:SetText(label); refresh()
+        b:SetHandler("OnClick", function()
+            CONFIG[field] = (CONFIG[field] == false)
+            refresh(); if after then after() end; if persist then SaveSettings() end
+        end)
+        return b
+    end
+    -- [-] value [+] adjuster at (x, y), width w. text()=label; dec()/inc() mutate+persist. No y advance.
+    local function adjuster(text, x, w, dec, inc)
+        local d = wOptions:CreateChildWidget("button", "ad" .. nid(), 0, true)
+        d:SetText("-"); d:SetExtent(24, 22); d:AddAnchor("TOPLEFT", wOptions, x, y)
+        local v = wOptions:CreateChildWidget("label", "av" .. nid(), 0, true)
+        v:SetText(text()); v:SetExtent(w - 52, 22); v:AddAnchor("LEFT", d, "RIGHT", 2, 0)
+        if v.style then v.style:SetAlign(ALIGN.CENTER); v.style:SetFontSize(12) end
+        local i = wOptions:CreateChildWidget("button", "ai" .. nid(), 0, true)
+        i:SetText("+"); i:SetExtent(24, 22); i:AddAnchor("LEFT", v, "RIGHT", 2, 0)
+        d:SetHandler("OnClick", function() dec(); v:SetText(text()) end)
+        i:SetHandler("OnClick", function() inc(); v:SetText(text()) end)
+    end
 
-    -- Width Control
-    local btnWDec = wOptions:CreateChildWidget("button", "WDec", 0, true); btnWDec:SetText("-"); btnWDec:SetExtent(30, 24); btnWDec:AddAnchor("TOPLEFT", wOptions, 105, 75)
-    lblWVal = wOptions:CreateChildWidget("label", "LWV", 0, true); lblWVal:SetText("W: " .. CONFIG.LIVE_WIDTH); lblWVal:SetExtent(100, 24); lblWVal:AddAnchor("LEFT", btnWDec, "RIGHT", 5, 0); if lblWVal.style then lblWVal.style:SetAlign(ALIGN.CENTER) end
-    local btnWInc = wOptions:CreateChildWidget("button", "WInc", 0, true); btnWInc:SetText("+"); btnWInc:SetExtent(30, 24); btnWInc:AddAnchor("LEFT", lblWVal, "RIGHT", 5, 0)
+    section("Live Window Size")
+    adjuster(function() return "W: " .. CONFIG.LIVE_WIDTH end, LX, CW,
+        function() CONFIG.LIVE_WIDTH = math.max(300, CONFIG.LIVE_WIDTH - 20); liveLayoutDirty = true; RebuildLiveLabels(); SaveSettings() end,
+        function() CONFIG.LIVE_WIDTH = math.min(800, CONFIG.LIVE_WIDTH + 20); liveLayoutDirty = true; RebuildLiveLabels(); SaveSettings() end)
+    adjuster(function() return "H: " .. CONFIG.LIVE_HEIGHT end, RX, CW,
+        function() CONFIG.LIVE_HEIGHT = math.max(200, CONFIG.LIVE_HEIGHT - 20); liveLayoutDirty = true; RebuildLiveLabels(); SaveSettings() end,
+        function() CONFIG.LIVE_HEIGHT = math.min(800, CONFIG.LIVE_HEIGHT + 20); liveLayoutDirty = true; RebuildLiveLabels(); SaveSettings() end)
+    y = y + 26
 
-    -- Height Control
-    local btnHDec = wOptions:CreateChildWidget("button", "HDec", 0, true); btnHDec:SetText("-"); btnHDec:SetExtent(30, 24); btnHDec:AddAnchor("TOPLEFT", wOptions, 105, 105)
-    lblHVal = wOptions:CreateChildWidget("label", "LHV", 0, true); lblHVal:SetText("H: " .. CONFIG.LIVE_HEIGHT); lblHVal:SetExtent(100, 24); lblHVal:AddAnchor("LEFT", btnHDec, "RIGHT", 5, 0); if lblHVal.style then lblHVal.style:SetAlign(ALIGN.CENTER) end
-    local btnHInc = wOptions:CreateChildWidget("button", "HInc", 0, true); btnHInc:SetText("+"); btnHInc:SetExtent(30, 24); btnHInc:AddAnchor("LEFT", lblHVal, "RIGHT", 5, 0)
+    section("Features")
+    toggle("ENABLE_SCANNER", "Scan Debuffs", LX, CW, true)
+    toggle("SHOW_TIMESTAMP", "Timestamps", RX, CW, true, function() RebuildLiveLabels(); UpdateHistoryDisplay() end)
+    y = y + 26
+    toggle("SHOW_ICONS", "Show Icons", LX, CW, true, function() liveLayoutDirty = true; RebuildLiveLabels(); UpdateHistoryDisplay() end)
+    y = y + 26
+    adjuster(function() return "Offset: " .. CONFIG.TIME_OFFSET .. "h" end, LX, CW,
+        function() CONFIG.TIME_OFFSET = CONFIG.TIME_OFFSET - 1; RebuildLiveLabels(); UpdateHistoryDisplay(); SaveSettings() end,
+        function() CONFIG.TIME_OFFSET = CONFIG.TIME_OFFSET + 1; RebuildLiveLabels(); UpdateHistoryDisplay(); SaveSettings() end)
+    adjuster(function() return "Scan: " .. CONFIG.SCAN_FREQ .. "ms" end, RX, CW,
+        function() CONFIG.SCAN_FREQ = math.max(100, CONFIG.SCAN_FREQ - 50); SaveSettings() end,
+        function() CONFIG.SCAN_FREQ = math.min(1000, CONFIG.SCAN_FREQ + 50); SaveSettings() end)
+    y = y + 26
 
-    btnWDec:SetHandler("OnClick", function() CONFIG.LIVE_WIDTH = math.max(300, CONFIG.LIVE_WIDTH - 20); lblWVal:SetText("W: " .. CONFIG.LIVE_WIDTH); liveLayoutDirty = true; RebuildLiveLabels(); SaveSettings() end)
-    btnWInc:SetHandler("OnClick", function() CONFIG.LIVE_WIDTH = math.min(800, CONFIG.LIVE_WIDTH + 20); lblWVal:SetText("W: " .. CONFIG.LIVE_WIDTH); liveLayoutDirty = true; RebuildLiveLabels(); SaveSettings() end)
-    btnHDec:SetHandler("OnClick", function() CONFIG.LIVE_HEIGHT = math.max(200, CONFIG.LIVE_HEIGHT - 20); lblHVal:SetText("H: " .. CONFIG.LIVE_HEIGHT); liveLayoutDirty = true; RebuildLiveLabels(); SaveSettings() end)
-    btnHInc:SetHandler("OnClick", function() CONFIG.LIVE_HEIGHT = math.min(800, CONFIG.LIVE_HEIGHT + 20); lblHVal:SetText("H: " .. CONFIG.LIVE_HEIGHT); liveLayoutDirty = true; RebuildLiveLabels(); SaveSettings() end)
+    -- Recording (floodgates capture control): which OTHER units get recorded. The master gate
+    -- LOG_ALLY_RECAP stays on while any class is being recorded.
+    section("Recording")
+    do
+        local rl = wOptions:CreateChildWidget("label", "rl" .. nid(), 0, true)
+        rl:SetText("Record:"); rl:SetExtent(52, 22); rl:AddAnchor("TOPLEFT", wOptions, LX, y)
+        if rl.style then rl.style:SetAlign(ALIGN.LEFT); rl.style:SetColor(0.7, 0.7, 0.7, 1); rl.style:SetFontSize(12) end
+        local recAfter = function() CONFIG.LOG_ALLY_RECAP = (CONFIG.REC_ALLY ~= false) or (CONFIG.REC_ENEMY ~= false) or (CONFIG.REC_MOB ~= false) end
+        toggle("REC_ALLY",  "Ally",  72,  80, true, recAfter)
+        toggle("REC_ENEMY", "Enemy", 156, 86, true, recAfter)
+        toggle("REC_MOB",   "Mob",   246, 86, true, recAfter)
+    end
+    y = y + 26
+    do
+        -- Disclaimer under Raid-Log: the addon only receives OTHERS' combat when the client's
+        -- "Damage/Heal Info: Target" is Raid or higher (Game Settings > Game Info).
+        local function recHint(txt)
+            local h = wOptions:CreateChildWidget("label", "recHint" .. nid(), 0, true)
+            h:SetText(txt); h:SetExtent(FULLW, 14); h:AddAnchor("TOPLEFT", wOptions, LX, y)
+            if h.style then h.style:SetAlign(ALIGN.CENTER); h.style:SetColor(0.62, 0.6, 0.52, 1); h.style:SetFontSize(11) end
+            y = y + 13
+        end
+        recHint("To capture others' combat, raise Damage/Heal Info:")
+        recHint("Target to Raid+  (Game Settings > Game Info)")
+    end
+    y = y + 8
 
-    -- === SECTION 2: FEATURES ===
-    local lblSec2 = wOptions:CreateChildWidget("label", "Sec2", 0, true)
-    lblSec2:SetText("Features")
-    lblSec2:AddAnchor("TOP", wOptions, 0, 150)
-    if lblSec2.style then lblSec2.style:SetColor(0.5, 0.8, 1, 1); lblSec2.style:SetAlign(ALIGN.CENTER) end
-
-    -- Scanner Toggle
-    btnScanToggle = wOptions:CreateChildWidget("button", "ScanTog", 0, true)
-    btnScanToggle:SetText(CONFIG.ENABLE_SCANNER and "Scan Debuffs: ON" or "Scan Debuffs: OFF")
-    btnScanToggle:SetExtent(240, 24); btnScanToggle:AddAnchor("TOP", wOptions, 0, 180)
-    btnScanToggle:SetTextColor(CONFIG.ENABLE_SCANNER and 0 or 1, CONFIG.ENABLE_SCANNER and 1 or 0, 0, 1)
-    btnScanToggle:SetHandler("OnClick", function() 
-        CONFIG.ENABLE_SCANNER = not CONFIG.ENABLE_SCANNER
-        btnScanToggle:SetText(CONFIG.ENABLE_SCANNER and "Scan Debuffs: ON" or "Scan Debuffs: OFF")
-        btnScanToggle:SetTextColor(CONFIG.ENABLE_SCANNER and 0 or 1, CONFIG.ENABLE_SCANNER and 1 or 0, 0, 1)
-    end)
-
-    -- Timestamp Toggle
-    btnTimeToggle = wOptions:CreateChildWidget("button", "TimeTog", 0, true)
-    btnTimeToggle:SetText(CONFIG.SHOW_TIMESTAMP and "Timestamps: ON" or "Timestamps: OFF")
-    btnTimeToggle:SetExtent(240, 24); btnTimeToggle:AddAnchor("TOP", wOptions, 0, 210)
-    btnTimeToggle:SetTextColor(CONFIG.SHOW_TIMESTAMP and 0 or 1, CONFIG.SHOW_TIMESTAMP and 1 or 0, 0, 1)
-    btnTimeToggle:SetHandler("OnClick", function() 
-        CONFIG.SHOW_TIMESTAMP = not CONFIG.SHOW_TIMESTAMP
-        btnTimeToggle:SetText(CONFIG.SHOW_TIMESTAMP and "Timestamps: ON" or "Timestamps: OFF")
-        btnTimeToggle:SetTextColor(CONFIG.SHOW_TIMESTAMP and 0 or 1, CONFIG.SHOW_TIMESTAMP and 1 or 0, 0, 1)
-        RebuildLiveLabels(); UpdateHistoryDisplay()
-    end)
-
-    -- Static Shock Filter Toggle
-    btnSSFilterToggle = wOptions:CreateChildWidget("button", "SSFiltTog", 0, true)
-    btnSSFilterToggle:SetText(CONFIG.FILTER_STATIC_SHOCK and "Filter Electric Shock Spam: ON" or "Filter Electric Shock Spam: OFF")
-    btnSSFilterToggle:SetExtent(240, 24); btnSSFilterToggle:AddAnchor("TOP", wOptions, 0, 240)
-    btnSSFilterToggle:SetTextColor(CONFIG.FILTER_STATIC_SHOCK and 0 or 1, CONFIG.FILTER_STATIC_SHOCK and 1 or 0, 0, 1)
-    btnSSFilterToggle:SetHandler("OnClick", function()
-        CONFIG.FILTER_STATIC_SHOCK = not CONFIG.FILTER_STATIC_SHOCK
-        btnSSFilterToggle:SetText(CONFIG.FILTER_STATIC_SHOCK and "Filter Electric Shock Spam: ON" or "Filter Electric Shock Spam: OFF")
-        btnSSFilterToggle:SetTextColor(CONFIG.FILTER_STATIC_SHOCK and 0 or 1, CONFIG.FILTER_STATIC_SHOCK and 1 or 0, 0, 1)
-    end)
-
-    -- Show Heals Toggle
-    local btnHealToggle = wOptions:CreateChildWidget("button", "HealTog", 0, true)
-    btnHealToggle:SetText(CONFIG.SHOW_HEALS and "Show Heals: ON" or "Show Heals: OFF")
-    btnHealToggle:SetExtent(240, 24); btnHealToggle:AddAnchor("TOP", wOptions, 0, 270)
-    btnHealToggle:SetTextColor(CONFIG.SHOW_HEALS and 0 or 1, CONFIG.SHOW_HEALS and 1 or 0, 0, 1)
-    btnHealToggle:SetHandler("OnClick", function()
-        CONFIG.SHOW_HEALS = not CONFIG.SHOW_HEALS
-        btnHealToggle:SetText(CONFIG.SHOW_HEALS and "Show Heals: ON" or "Show Heals: OFF")
-        btnHealToggle:SetTextColor(CONFIG.SHOW_HEALS and 0 or 1, CONFIG.SHOW_HEALS and 1 or 0, 0, 1)
-        SaveSettings()
-    end)
-
-    -- Time Offset Control
-    local btnOffDec = wOptions:CreateChildWidget("button", "OffDec", 0, true); btnOffDec:SetText("-"); btnOffDec:SetExtent(30, 24); btnOffDec:AddAnchor("TOPLEFT", wOptions, 75, 300)
-    lblOffVal = wOptions:CreateChildWidget("label", "OffVal", 0, true); lblOffVal:SetText("Timestamp Offset: " .. CONFIG.TIME_OFFSET .. "h"); lblOffVal:SetExtent(160, 24); lblOffVal:AddAnchor("LEFT", btnOffDec, "RIGHT", 5, 0); if lblOffVal.style then lblOffVal.style:SetAlign(ALIGN.CENTER) end
-    local btnOffInc = wOptions:CreateChildWidget("button", "OffInc", 0, true); btnOffInc:SetText("+"); btnOffInc:SetExtent(30, 24); btnOffInc:AddAnchor("LEFT", lblOffVal, "RIGHT", 5, 0)
-
-    btnOffDec:SetHandler("OnClick", function() CONFIG.TIME_OFFSET = CONFIG.TIME_OFFSET - 1; lblOffVal:SetText("Timestamp Offset: " .. CONFIG.TIME_OFFSET .. "h"); RebuildLiveLabels(); UpdateHistoryDisplay() end)
-    btnOffInc:SetHandler("OnClick", function() CONFIG.TIME_OFFSET = CONFIG.TIME_OFFSET + 1; lblOffVal:SetText("Timestamp Offset: " .. CONFIG.TIME_OFFSET .. "h"); RebuildLiveLabels(); UpdateHistoryDisplay() end)
-
-    -- Scan Frequency Control (ms between each debuff/buff scanner tick)
-    local btnSFDec = wOptions:CreateChildWidget("button", "SFDec", 0, true); btnSFDec:SetText("-"); btnSFDec:SetExtent(30, 24); btnSFDec:AddAnchor("TOPLEFT", wOptions, 105, 330)
-    lblScanFreqVal = wOptions:CreateChildWidget("label", "SFVal", 0, true); lblScanFreqVal:SetText("Scan: " .. CONFIG.SCAN_FREQ .. "ms"); lblScanFreqVal:SetExtent(100, 24); lblScanFreqVal:AddAnchor("LEFT", btnSFDec, "RIGHT", 5, 0); if lblScanFreqVal.style then lblScanFreqVal.style:SetAlign(ALIGN.CENTER) end
-    local btnSFInc = wOptions:CreateChildWidget("button", "SFInc", 0, true); btnSFInc:SetText("+"); btnSFInc:SetExtent(30, 24); btnSFInc:AddAnchor("LEFT", lblScanFreqVal, "RIGHT", 5, 0)
-
-    btnSFDec:SetHandler("OnClick", function() CONFIG.SCAN_FREQ = math.max(100, CONFIG.SCAN_FREQ - 50); lblScanFreqVal:SetText("Scan: " .. CONFIG.SCAN_FREQ .. "ms"); SaveSettings() end)
-    btnSFInc:SetHandler("OnClick", function() CONFIG.SCAN_FREQ = math.min(1000, CONFIG.SCAN_FREQ + 50); lblScanFreqVal:SetText("Scan: " .. CONFIG.SCAN_FREQ .. "ms"); SaveSettings() end)
-
-    -- === SECTION 3: COLORS ===
-    local lblSec3 = wOptions:CreateChildWidget("label", "Sec3", 0, true)
-    lblSec3:SetText("Color Theme")
-    lblSec3:AddAnchor("TOP", wOptions, 0, 370)
-    if lblSec3.style then lblSec3.style:SetColor(0.5, 0.8, 1, 1); lblSec3.style:SetAlign(ALIGN.CENTER) end
-
+    section("Color Theme")
     local palletWindow = nil
-    local function CreateColorSwatch(id, label, configKey, yOffset)
-        local l = wOptions:CreateChildWidget("label", "CL"..id, 0, true)
-        l:SetText(label); l:SetExtent(140, 24); l:AddAnchor("TOPLEFT", wOptions, 80, yOffset)
-
-        local swatch = wOptions:CreateChildWidget("button", "CS"..id, 0, true)
-        swatch:SetExtent(55, 14); swatch:AddAnchor("LEFT", l, "RIGHT", 20, 5)
-
-        local col = CONFIG[configKey]
-        local bg = swatch:CreateColorDrawable(col[1], col[2], col[3], 1, "background")
-        bg:AddAnchor("TOPLEFT", swatch, 0, 0); bg:AddAnchor("BOTTOMRIGHT", swatch, 0, 0)
-        swatch.colorBG = bg
-        swatch.r, swatch.g, swatch.b = col[1], col[2], col[3]
-
-        swatch:SetHandler("OnClick", function(self)
+    local swatches = {}
+    local DEFAULT_COLORS = {
+        COL_OUT_NRM = {1, 0.5, 0}, COL_OUT_CRIT = {1, 0, 0}, COL_INCOMING = {1, 0.5, 0},
+        COL_HEAL = {0, 1, 0}, COL_CC = {0.8, 0.3, 1}, COL_ZEAL_CRIT = {1, 0.3, 1}, COL_SKILL_LABEL = {0, 1, 1},
+    }
+    local function swatchCell(label, key, x)
+        local l = wOptions:CreateChildWidget("label", "cl" .. nid(), 0, true)
+        l:SetText(label); l:SetExtent(108, 18); l:AddAnchor("TOPLEFT", wOptions, x, y)
+        if l.style then l.style:SetAlign(ALIGN.LEFT); l.style:SetFontSize(12) end
+        local sw = wOptions:CreateChildWidget("button", "cs" .. nid(), 0, true)
+        sw:SetExtent(46, 14); sw:AddAnchor("TOPLEFT", wOptions, x + 112, y + 3)
+        local col = CONFIG[key]
+        local bg = sw:CreateColorDrawable(col[1], col[2], col[3], 1, "background")
+        bg:AddAnchor("TOPLEFT", sw, 0, 0); bg:AddAnchor("BOTTOMRIGHT", sw, 0, 0)
+        sw.colorBG = bg; sw.cfgKey = key
+        sw:SetHandler("OnClick", function(self)
             if palletWindow then palletWindow:Show(false); palletWindow = nil end
-            palletWindow = W_ETC.CreatePopupPallet("clpPallet_"..id, "UIParent")
-            palletWindow:SetUILayer("hud")
-            palletWindow:SetCloseOnEscape(true)
-            palletWindow:RemoveAllAnchors()
-            palletWindow:Show(true)
+            palletWindow = W_ETC.CreatePopupPallet("clpPallet_" .. key, "UIParent")
+            palletWindow:SetUILayer("hud"); palletWindow:SetCloseOnEscape(true)
+            palletWindow:RemoveAllAnchors(); palletWindow:Show(true)
             palletWindow:AddAnchor("TOPLEFT", self, "TOPRIGHT", 2, 0)
             palletWindow:SetSelectEventListenWidget(self)
             palletWindow:EnableHidingIsRemove(true)
             palletWindow:SetHandler("OnHide", function() palletWindow = nil end)
         end)
-
-        function swatch:SelectedProcedure(r, g, b, a)
-            self.colorBG:SetColor(r, g, b, 1)
-            self.r, self.g, self.b = r, g, b
-            CONFIG[configKey] = {r, g, b}
-            SaveSettings()
+        function sw:SelectedProcedure(r, g, b, a)
+            self.colorBG:SetColor(r, g, b, 1); CONFIG[self.cfgKey] = {r, g, b}; SaveSettings()
         end
-
-        return swatch
+        swatches[#swatches + 1] = sw
     end
+    swatchCell("Outgoing Dmg", "COL_OUT_NRM",     LX); swatchCell("Critical Hits", "COL_OUT_CRIT",  RX); y = y + 24
+    swatchCell("Incoming Dmg", "COL_INCOMING",    LX); swatchCell("Healing",       "COL_HEAL",      RX); y = y + 24
+    swatchCell("CC Effects",   "COL_CC",          LX); swatchCell("Zeal Crit",     "COL_ZEAL_CRIT", RX); y = y + 24
+    swatchCell("Skill Labels", "COL_SKILL_LABEL", LX); y = y + 26
 
-    local DEFAULT_COLORS = {
-        COL_OUT_NRM   = {1, 0.5, 0},
-        COL_OUT_CRIT  = {1, 0, 0},
-        COL_INCOMING  = {1, 0.5, 0},
-        COL_HEAL      = {0, 1, 0},
-        COL_CC        = {0.8, 0.3, 1},
-        COL_ZEAL_CRIT = {1, 0.3, 1},
-        COL_SKILL_LABEL = {0, 1, 1},
-    }
-    local sw1 = CreateColorSwatch(1, "Outgoing Dmg",  "COL_OUT_NRM",    400)
-    local sw2 = CreateColorSwatch(2, "Critical Hits", "COL_OUT_CRIT",   430)
-    local sw3 = CreateColorSwatch(3, "Incoming Dmg",  "COL_INCOMING",   460)
-    local sw4 = CreateColorSwatch(4, "Healing",       "COL_HEAL",       490)
-    local sw5 = CreateColorSwatch(5, "CC Effects",    "COL_CC",         520)
-    local sw6 = CreateColorSwatch(6, "Zeal Crit",     "COL_ZEAL_CRIT",  550)
-    local sw7 = CreateColorSwatch(7, "Skill Labels",  "COL_SKILL_LABEL",580)
+    do
+        local bf = wOptions:CreateChildWidget("button", "bf" .. nid(), 0, true)
+        bf:SetExtent(CW, 22); bf:AddAnchor("TOP", wOptions, 0, y)
+        local bg = bf:CreateColorDrawable(0.18, 0.18, 0.24, 1, "background")
+        bg:AddAnchor("TOPLEFT", bf, 0, 0); bg:AddAnchor("BOTTOMRIGHT", bf, 0, 0)
+        bf:SetText("Manage Filters..."); if bf.style then bf.style:SetAlign(ALIGN.CENTER); bf.style:SetFontSize(12) end
+        bf:SetTextColor(0.7, 0.85, 1, 1)
+        bf:SetHandler("OnClick", function() if CONFIG._openFilters then CONFIG._openFilters() end end)
+    end
+    y = y + 26
+
+    -- Size the window to the content + room for the two bottom buttons.
+    wOptions:SetHeight(y + 84)
 
     local btnClose = wOptions:CreateChildWidget("button", "Close", 0, true)
-    btnClose:SetText("Done"); btnClose:SetExtent(120, 26); btnClose:AddAnchor("BOTTOM", wOptions, 0, -15)
+    btnClose:SetExtent(150, 26); btnClose:AddAnchor("BOTTOM", wOptions, 0, -14)
+    do local bg = btnClose:CreateColorDrawable(0.16, 0.3, 0.46, 1, "background"); bg:AddAnchor("TOPLEFT", btnClose, 0, 0); bg:AddAnchor("BOTTOMRIGHT", btnClose, 0, 0) end
+    btnClose:SetText("Done"); if btnClose.style then btnClose.style:SetAlign(ALIGN.CENTER) end
     btnClose:SetHandler("OnClick", function() wOptions:Show(false) end)
 
     local btnRestore = wOptions:CreateChildWidget("button", "RestoreColors", 0, true)
-    btnRestore:SetText("Restore Default Colors"); btnRestore:SetExtent(200, 26); btnRestore:AddAnchor("BOTTOM", btnClose, "TOP", 0, -10)
+    btnRestore:SetExtent(200, 22); btnRestore:AddAnchor("BOTTOM", btnClose, "TOP", 0, -8)
+    btnRestore:SetText("Restore Default Colors"); if btnRestore.style then btnRestore.style:SetAlign(ALIGN.CENTER); btnRestore.style:SetFontSize(12) end
+    btnRestore:SetTextColor(0.85, 0.72, 0.5, 1)
     btnRestore:SetHandler("OnClick", function()
-        local swatches = {
-            { sw1, "COL_OUT_NRM"    },
-            { sw2, "COL_OUT_CRIT"   },
-            { sw3, "COL_INCOMING"   },
-            { sw4, "COL_HEAL"       },
-            { sw5, "COL_CC"         },
-            { sw6, "COL_ZEAL_CRIT"  },
-            { sw7, "COL_SKILL_LABEL"},
-        }
-        for _, entry in ipairs(swatches) do
-            local sw, key = entry[1], entry[2]
-            local d = DEFAULT_COLORS[key]
-            CONFIG[key] = {d[1], d[2], d[3]}
-            sw.colorBG:SetColor(d[1], d[2], d[3], 1)
-            sw.r, sw.g, sw.b = d[1], d[2], d[3]
+        for _, sw in ipairs(swatches) do
+            local d = DEFAULT_COLORS[sw.cfgKey]
+            if d then CONFIG[sw.cfgKey] = {d[1], d[2], d[3]}; sw.colorBG:SetColor(d[1], d[2], d[3], 1) end
         end
         SaveSettings()
     end)
+end
+
+-- In-game Filter Manager: type a skill/buff name + Add to hide it from the log,
+-- click X next to an entry to un-hide it. Custom filters persist in settings.txt and
+-- merge straight into IGNORE_LOOKUP (the path IsIgnoredBuff checks: scanner + combat
+-- lines). Stored entirely on CONFIG/closures -- adds ZERO main-chunk locals, so it
+-- stays within Lua 5.1's 200-locals-per-function limit. Window is built once, lazily.
+CONFIG._openFilters = function()
+    CONFIG._customFilters = CONFIG._customFilters or {}   -- safety: should be set by LoadSavedSettings
+    if not CONFIG._wFilters then
+        local VIS = 12
+        local win = api.Interface:CreateEmptyWindow("ClpFilters", "UIParent")
+        CONFIG._wFilters = win
+        win:Show(false); win:SetExtent(340, 480); win:AddAnchor("CENTER", "UIParent", 0, 0)
+        MakeDraggable(win, win)
+        CreateBackdrop(win, {0.05, 0.05, 0.05, 0.96})
+
+        local tbar = win:CreateChildWidget("emptywidget", "fTBar", 0, true)
+        tbar:AddAnchor("TOPLEFT", win, 0, 0); tbar:AddAnchor("TOPRIGHT", win, 0, 0); tbar:SetHeight(30)
+        CreateBackdrop(tbar, COL_HEADER)
+        local title = win:CreateChildWidget("label", "fTitle", 0, true)
+        title:SetText("Skill / Buff Filters"); title:SetExtent(260, 26); title:AddAnchor("LEFT", tbar, 12, 0)
+        if title.style then title.style:SetFontSize(16); title.style:SetAlign(ALIGN.LEFT) end
+        MakeDraggable(tbar, win)
+        MakeDraggable(title, win)   -- the title label covers most of the bar; make it a drag handle too
+
+        -- Dark button style matching the rest of the addon (Options / live feed) -- replaces the
+        -- game's tan ApplyButtonSkin so this window is uniform. Local, so no main-chunk local.
+        local function skin(btn)
+            local d = btn:CreateColorDrawable(0.18, 0.18, 0.23, 1, "background")
+            d:AddAnchor("TOPLEFT", btn, 0, 0); d:AddAnchor("BOTTOMRIGHT", btn, 0, 0)
+            if btn.style then btn.style:SetAlign(ALIGN.CENTER); btn.style:SetFontSize(12) end
+            btn:SetTextColor(0.82, 0.88, 1, 1)
+            return true
+        end
+
+        -- Add row: typable field + Add button
+        local edit = W_CTRL.CreateEdit("clpFilterEdit", win)
+        edit:SetExtent(208, 24); edit:AddAnchor("TOPLEFT", win, 14, 44)
+
+        local addBtn = win:CreateChildWidget("button", "fAdd", 0, true)
+        skin(addBtn)
+        addBtn:SetExtent(72, 26); addBtn:AddAnchor("LEFT", edit, "RIGHT", 8, 0); addBtn:SetText("Add")
+
+        local hint = win:CreateChildWidget("label", "fHint", 0, true)
+        hint:SetText("Type a skill/buff name, then Add. Hidden everywhere in the log.")
+        hint:AddAnchor("TOPLEFT", win, 14, 72); hint:SetExtent(312, 16)
+        if hint.style then hint.style:SetAlign(ALIGN.LEFT); hint.style:SetColor(0.5, 0.5, 0.5, 1); hint.style:SetFontSize(11) end
+
+        local listHdr = win:CreateChildWidget("label", "fListHdr", 0, true)
+        listHdr:SetText("Filtered:"); listHdr:SetExtent(180, 20); listHdr:AddAnchor("TOPLEFT", win, 14, 94)
+        if listHdr.style then listHdr.style:SetColor(0.5, 0.8, 1, 1); listHdr.style:SetAlign(ALIGN.LEFT) end
+
+        -- Show Defaults toggle: reveals the built-in filters (gray) so they can be removed too.
+        local toggleDef = win:CreateChildWidget("button", "fShowDef", 0, true)
+        skin(toggleDef)
+        toggleDef:SetExtent(118, 22); toggleDef:AddAnchor("TOPRIGHT", win, -14, 92)
+        local function refreshToggle()
+            toggleDef:SetText(CONFIG._showDefaults and "Defaults: ON" or "Defaults: OFF")
+        end
+        refreshToggle()
+        toggleDef:SetHandler("OnClick", function()
+            CONFIG._showDefaults = not CONFIG._showDefaults
+            CONFIG._filterScroll = 0
+            refreshToggle()
+            SaveSettings()
+            if CONFIG._renderFilters then CONFIG._renderFilters() end
+        end)
+
+        -- Scrollable list body
+        local body = win:CreateChildWidget("emptywidget", "fBody", 0, true)
+        body:AddAnchor("TOPLEFT", win, 10, 116); body:AddAnchor("BOTTOMRIGHT", win, -10, -46)
+        CreateBackdrop(body, {0.10, 0.10, 0.10, 0.9})
+        body:SetHandler("OnMouseWheel", function(_, d)
+            CONFIG._filterScroll = (CONFIG._filterScroll or 0) - d
+            if CONFIG._renderFilters then CONFIG._renderFilters() end
+        end)
+
+        -- Row pool: name label + red X remove button
+        local rows = {}
+        for i = 1, VIS do
+            local row = body:CreateChildWidget("emptywidget", "fRow"..i, 0, true)
+            row:SetExtent(300, 24); row:AddAnchor("TOPLEFT", body, 6, 6 + ((i-1) * 26))
+
+            local lbl = body:CreateChildWidget("label", "fRowL"..i, 0, true)
+            lbl:AddAnchor("LEFT", row, 4, 0); lbl:SetExtent(252, 24)
+            if lbl.style then lbl.style:SetAlign(ALIGN.LEFT) end
+            row.lbl = lbl
+
+            local x = body:CreateChildWidget("button", "fRowX"..i, 0, true)
+            skin(x)
+            x:SetExtent(22, 22); x:AddAnchor("RIGHT", row, "RIGHT", 0, 0)
+            x:SetText("-"); x:SetTextColor(1, 0.45, 0.45, 1)
+            x:SetHandler("OnClick", function()
+                local name = row.filterName
+                if name then
+                    local ln = string.lower(name)
+                    if row.isDefault then
+                        IGNORE_LOOKUP[ln] = false        -- disable a built-in default (persists, survives updates)
+                    else
+                        IGNORE_LOOKUP[ln] = nil           -- remove a custom filter
+                        local list = CONFIG._customFilters
+                        for idx = #list, 1, -1 do
+                            if string.lower(list[idx]) == ln then table.remove(list, idx) end
+                        end
+                    end
+                    for k in pairs(isIgnoredCache) do isIgnoredCache[k] = nil end
+                    SaveSettings()
+                    if CONFIG._renderFilters then CONFIG._renderFilters() end
+                end
+            end)
+            row.x = x
+            rows[i] = row
+        end
+
+        local doneBtn = win:CreateChildWidget("button", "fDone", 0, true)
+        skin(doneBtn)
+        doneBtn:SetExtent(110, 26); doneBtn:AddAnchor("BOTTOM", win, 0, -12); doneBtn:SetText("Done")
+        doneBtn:SetHandler("OnClick", function() win:Show(false) end)
+
+        -- Scroll buttons -- addon UIs don't receive mousewheel, so the (long) defaults list
+        -- needs these. Each click pages by VIS rows; the render clamps the offset.
+        local function scrollBy(delta)
+            CONFIG._filterScroll = (CONFIG._filterScroll or 0) + delta
+            if CONFIG._renderFilters then CONFIG._renderFilters() end
+        end
+        local upBtn = win:CreateChildWidget("button", "fUp", 0, true)
+        skin(upBtn)
+        upBtn:SetExtent(44, 24); upBtn:AddAnchor("BOTTOMLEFT", win, 12, -13); upBtn:SetText("^")
+        upBtn:SetHandler("OnClick", function() scrollBy(-VIS) end)
+        local downBtn = win:CreateChildWidget("button", "fDn", 0, true)
+        skin(downBtn)
+        downBtn:SetExtent(44, 24); downBtn:AddAnchor("LEFT", upBtn, "RIGHT", 6, 0); downBtn:SetText("v")
+        downBtn:SetHandler("OnClick", function() scrollBy(VIS) end)
+
+        local function doAdd()
+            local name = tostring(edit:GetText() or ""):gsub("^%s*(.-)%s*$", "%1")  -- trim
+            local ln = string.lower(name)
+            if name ~= "" and not IGNORE_LOOKUP[ln] then  -- skip blanks / already-filtered / dup
+                IGNORE_LOOKUP[ln] = true
+                local list = CONFIG._customFilters
+                list[#list + 1] = name
+                for k in pairs(isIgnoredCache) do isIgnoredCache[k] = nil end
+                SaveSettings()
+                edit:SetText(""); CONFIG._filterScroll = 0
+            end
+            if CONFIG._renderFilters then CONFIG._renderFilters() end
+        end
+        addBtn:SetHandler("OnClick", doAdd)
+
+        CONFIG._renderFilters = function()
+            -- Visible list: your custom filters (white) first, then -- if "Show Defaults" is
+            -- on -- the still-active built-in defaults (gray). Disabled defaults are skipped.
+            local items = {}
+            local cf = {}
+            for _, n in ipairs(CONFIG._customFilters) do cf[#cf + 1] = n end
+            table.sort(cf, function(a, b) return string.lower(a) < string.lower(b) end)
+            for _, n in ipairs(cf) do items[#items + 1] = { name = n, def = false } end
+            local nCustom, nDef = #cf, 0
+            if CONFIG._showDefaults then
+                local df = {}
+                for _, n in ipairs(IGNORE_BUFFS_RAW) do
+                    if IGNORE_LOOKUP[string.lower(n)] ~= false then df[#df + 1] = n end  -- skip disabled
+                end
+                table.sort(df, function(a, b) return string.lower(a) < string.lower(b) end)
+                for _, n in ipairs(df) do items[#items + 1] = { name = n, def = true } end
+                nDef = #df
+            end
+
+            local total = #items
+            local maxScroll = total - VIS
+            if maxScroll < 0 then maxScroll = 0 end
+            local off = CONFIG._filterScroll or 0
+            if off > maxScroll then off = maxScroll end
+            if off < 0 then off = 0 end
+            CONFIG._filterScroll = off
+
+            if CONFIG._showDefaults then
+                listHdr:SetText("Yours: " .. nCustom .. "   Defaults: " .. nDef)
+            else
+                listHdr:SetText("Filtered: " .. nCustom)
+            end
+            for i = 1, VIS do
+                local row, it = rows[i], items[i + off]
+                if it then
+                    row.filterName = it.name; row.isDefault = it.def
+                    row.lbl:SetText(it.name)
+                    if row.lbl.style then
+                        if it.def then row.lbl.style:SetColor(0.5, 0.5, 0.5, 1)
+                        else row.lbl.style:SetColor(0.95, 0.95, 0.95, 1) end
+                    end
+                    row:Show(true); row.lbl:Show(true); row.x:Show(true)
+                else
+                    row.filterName = nil; row.isDefault = nil
+                    row:Show(false); row.lbl:Show(false); row.x:Show(false)
+                end
+            end
+        end
+    end
+    CONFIG._wFilters:Show(true)
+    if CONFIG._renderFilters then CONFIG._renderFilters() end
+end
+
+-- In-game icon picker. Opened by clicking a recap icon (which stamps the skill). Shows a
+-- searchable, scrollable grid of every icon in all_icons.lua; picking one writes the override
+-- to icon_overrides.txt (the file testers send back), clears the icon cache, and refreshes.
+-- Everything on CONFIG/closures -- no new main-chunk local (we're at the 200 cap).
+CONFIG._openIconPicker = function(skill)
+    if skill then CONFIG._iconEditSkill = skill end
+    if not CONFIG._allIcons then
+        local ok, t = pcall(require, "/CombatLogPro/all_icons")
+        CONFIG._allIcons = (ok and type(t) == "table") and t or {}
+    end
+    if not CONFIG._iconPickerWin then
+        local COLS, ROWS, CELL = 6, 8, 42
+        local W = COLS * CELL + 28
+        local win = api.Interface:CreateEmptyWindow("ClpIconPicker", "UIParent")
+        CONFIG._iconPickerWin = win
+        win:Show(false); win:SetExtent(W, ROWS * CELL + 124); win:AddAnchor("CENTER", "UIParent", 0, 0)
+        MakeDraggable(win, win); CreateBackdrop(win, {0.05, 0.05, 0.05, 0.97})
+
+        local tbar = win:CreateChildWidget("emptywidget", "ipTBar", 0, true)
+        tbar:AddAnchor("TOPLEFT", win, 0, 0); tbar:AddAnchor("TOPRIGHT", win, 0, 0); tbar:SetHeight(30)
+        CreateBackdrop(tbar, COL_HEADER)
+        local title = win:CreateChildWidget("label", "ipTitle", 0, true)
+        title:SetText("Pick Icon"); title:SetExtent(W - 24, 26); title:AddAnchor("LEFT", tbar, 12, 0)
+        if title.style then title.style:SetFontSize(15); title.style:SetAlign(ALIGN.LEFT) end
+        MakeDraggable(tbar, win)
+
+        local sub = win:CreateChildWidget("label", "ipSub", 0, true)
+        sub:SetExtent(W - 24, 16); sub:AddAnchor("TOPLEFT", win, 14, 34)
+        if sub.style then sub.style:SetAlign(ALIGN.LEFT); sub.style:SetColor(0.5, 0.85, 1, 1); sub.style:SetFontSize(11) end
+
+        local edit = W_CTRL.CreateEdit("clpIconSearch", win)
+        edit:SetExtent(W - 90, 22); edit:AddAnchor("TOPLEFT", win, 14, 54)
+        edit:SetHandler("OnTextChanged", function(self)
+            CONFIG._iconFilter = string.lower(tostring(self:GetText() or ""))
+            CONFIG._iconScroll = 0
+            if CONFIG._renderIconPicker then CONFIG._renderIconPicker() end
+        end)
+        local shint = win:CreateChildWidget("label", "ipHint", 0, true)
+        shint:SetText("search"); shint:AddAnchor("LEFT", edit, "RIGHT", 6, 0); shint:SetExtent(60, 22)
+        if shint.style then shint.style:SetColor(0.4, 0.4, 0.4, 1) end
+
+        local body = win:CreateChildWidget("emptywidget", "ipBody", 0, true)
+        body:AddAnchor("TOPLEFT", win, 14, 84); body:SetExtent(COLS * CELL, ROWS * CELL)
+        local cells = {}
+        for r = 0, ROWS - 1 do for c = 0, COLS - 1 do
+            local b = ClpMakeIcon(body, CELL - 4)
+            if b then
+                b:AddAnchor("TOPLEFT", body, c * CELL, r * CELL); b:Show(false)
+                pcall(function() b:SetHandler("OnClick", function(self)
+                    if self.iconName and CONFIG._iconEditSkill then
+                        CONFIG._iconOverrides = CONFIG._iconOverrides or {}
+                        CONFIG._iconOverrides[CONFIG._iconEditSkill] = self.iconName
+                        pcall(function() api.File:Write("CombatLogPro/icon_overrides.txt", CONFIG._iconOverrides) end)
+                        for k in pairs(iconPathCache) do iconPathCache[k] = nil end
+                        win:Show(false); UpdateHistoryDisplay(); UpdateSessionList()
+                    end
+                end) end)
+                cells[#cells + 1] = b
+            end
+        end end
+
+        local function scroll(d) CONFIG._iconScroll = (CONFIG._iconScroll or 0) + d; if CONFIG._renderIconPicker then CONFIG._renderIconPicker() end end
+        local up = win:CreateChildWidget("button", "ipUp", 0, true); up:SetText("^"); up:SetExtent(40, 24); up:AddAnchor("BOTTOMLEFT", win, 12, -12); up:SetHandler("OnClick", function() scroll(-ROWS) end)
+        local dn = win:CreateChildWidget("button", "ipDn", 0, true); dn:SetText("v"); dn:SetExtent(40, 24); dn:AddAnchor("LEFT", up, "RIGHT", 6, 0); dn:SetHandler("OnClick", function() scroll(ROWS) end)
+        local clr = win:CreateChildWidget("button", "ipClr", 0, true); clr:SetText("Clear"); clr:SetExtent(56, 24); clr:AddAnchor("LEFT", dn, "RIGHT", 8, 0)
+        clr:SetHandler("OnClick", function()
+            if CONFIG._iconEditSkill and CONFIG._iconOverrides then
+                CONFIG._iconOverrides[CONFIG._iconEditSkill] = nil
+                pcall(function() api.File:Write("CombatLogPro/icon_overrides.txt", CONFIG._iconOverrides) end)
+                for k in pairs(iconPathCache) do iconPathCache[k] = nil end
+                win:Show(false); UpdateHistoryDisplay(); UpdateSessionList()
+            end
+        end)
+        local done = win:CreateChildWidget("button", "ipDone", 0, true); done:SetText("Done"); done:SetExtent(64, 24); done:AddAnchor("BOTTOMRIGHT", win, -12, -12); done:SetHandler("OnClick", function() win:Show(false) end)
+
+        CONFIG._renderIconPicker = function()
+            local flt = CONFIG._iconFilter or ""
+            local list = {}
+            for _, nm in ipairs(CONFIG._allIcons) do
+                if flt == "" or string.find(nm, flt, 1, true) then list[#list + 1] = nm end
+            end
+            local total = #list
+            local maxScroll = math.ceil(total / COLS) - ROWS
+            if maxScroll < 0 then maxScroll = 0 end
+            local off = CONFIG._iconScroll or 0
+            if off > maxScroll then off = maxScroll end
+            if off < 0 then off = 0 end
+            CONFIG._iconScroll = off
+            local forName = ({ ["__mob__"] = "all mobs", ["__player__"] = "all players", ["__mount__"] = "all mounts", ["__death__"] = "session-death marker" })[CONFIG._iconEditSkill] or tostring(CONFIG._iconEditSkill or "?")
+            sub:SetText("for: " .. forName .. "   (" .. total .. " icons)")
+            local startIdx = off * COLS
+            for ci = 1, #cells do
+                local nm = list[startIdx + ci]
+                local b = cells[ci]
+                if nm then b.iconName = nm; ClpSetIcon(b, "Game\\ui\\icon\\" .. nm .. ".dds")
+                else b.iconName = nil; b:Show(false) end
+            end
+        end
+    end
+    CONFIG._iconPickerWin:Show(true); CONFIG._iconPickerWin:Raise()
+    if CONFIG._renderIconPicker then CONFIG._renderIconPicker() end
+end
+
+-- Builds the history window. File-scope (not inside Load) so its many widget
+-- references are CreateHistoryWindow's upvalues, not Load's — keeps Load well
+-- under Lua's 60-upvalue limit. Sidebar drills: names -> that name's sessions.
+local function CreateHistoryWindow()
+    wHistory = api.Interface:CreateEmptyWindow("HistWin", "UIParent")
+    wHistory:Show(false)
+    wHistory:SetExtent(CONFIG.HIST_WIDTH, CONFIG.HIST_HEIGHT)
+    if savedSettings.histX then
+        wHistory:AddAnchor("TOPLEFT", "UIParent", savedSettings.histX, savedSettings.histY)
+    else
+        wHistory:AddAnchor("CENTER", "UIParent", 0, 0)
+    end
+
+    local histHeader = wHistory:CreateChildWidget("emptywidget", "hHeader", 0, true)
+    histHeader:AddAnchor("TOPLEFT", wHistory, 0, 0)
+    histHeader:AddAnchor("TOPRIGHT", wHistory, 0, 0)
+    histHeader:SetHeight(30)
+    CreateBackdrop(histHeader, COL_HEADER)
+    MakeDraggable(histHeader, wHistory, SaveSettings)
+
+    -- Title (left)
+    local histTitle = histHeader:CreateChildWidget("label", "hTitle", 0, true)
+    histTitle:SetText("Session History")
+    histTitle:AddAnchor("LEFT", histHeader, 12, 0)
+    histTitle:SetExtent(140, 30)
+    if histTitle.style then histTitle.style:SetFontSize(15); histTitle.style:SetAlign(ALIGN.LEFT) end
+    MakeDraggable(histTitle, wHistory, SaveSettings)
+
+    -- Action buttons (right): Close, then Options to its left
+    local btnClose = histHeader:CreateChildWidget("button", "close", 0, true)
+    btnClose:AddAnchor("RIGHT", histHeader, -5, 0)
+    btnClose:SetExtent(28, 24)
+    btnClose:SetText("X")
+    btnClose:SetHandler("OnClick", function() wHistory:Show(false); if CONFIG._refreshHistBtn then CONFIG._refreshHistBtn() end end)
+
+    local btnHistOpt = histHeader:CreateChildWidget("button", "hOpt", 0, true)
+    btnHistOpt:AddAnchor("RIGHT", btnClose, "LEFT", -6, 0)
+    btnHistOpt:SetExtent(60, 24)
+    btnHistOpt:SetText("Options")
+    btnHistOpt:SetHandler("OnClick", function() if not wOptions then CreateOptionsWindow() end; wOptions:Show(not wOptions:IsVisible()) end)
+
+    -- Name search/filter box (guarded; filters the names list)
+    if W_CTRL and W_CTRL.CreateEdit then
+        local searchBox = W_CTRL.CreateEdit("clpSessSearch", histHeader)
+        searchBox:SetExtent(180, 20)
+        searchBox:AddAnchor("LEFT", histTitle, "RIGHT", 8, 0)
+        searchBox:SetHandler("OnTextChanged", function(self)
+            sessionFilter = tostring(self:GetText() or "")
+            -- Name search = find a PERSON across ALL fights. Drop into the Overall scope and list its
+            -- contributors filtered by the typed text (clicking one VIEWS that unit's combat across
+            -- every fight). Clearing the box pops back to the fights list.
+            if sessionFilter ~= "" then
+                selectedGroup = (sessionGroups[1] and sessionGroups[1].isOverall) and sessionGroups[1] or selectedGroup
+                sidebarMode = "SESSIONS"
+            else
+                selectedGroup = nil
+                sidebarMode = "NAMES"
+            end
+            UpdateSessionList()
+        end)
+        local searchHint = histHeader:CreateChildWidget("label", "clpSearchHint", 0, true)
+        searchHint:SetText("filter by name")
+        searchHint:AddAnchor("LEFT", searchBox, "RIGHT", 8, 0)
+        searchHint:SetExtent(120, 30)
+        if searchHint.style then searchHint.style:SetAlign(ALIGN.LEFT); searchHint.style:SetColor(0.4, 0.4, 0.4, 1) end
+    end
+
+    -- Category filter bar across the top (below the header). Toggling a chip filters the names
+    -- list (a name shows only if it holds data in an enabled category) and the feed. Persisted.
+    local catBar = wHistory:CreateChildWidget("emptywidget", "hCatBar", 0, true)
+    catBar:AddAnchor("TOPLEFT", histHeader, "BOTTOMLEFT", 0, 0)
+    catBar:AddAnchor("TOPRIGHT", histHeader, "BOTTOMRIGHT", 0, 0)
+    catBar:SetHeight(28)
+    CreateBackdrop(catBar, {0.11, 0.11, 0.11, 1})
+    do
+        -- WHO x WHAT x DIR filter. Each toggle flips a CONFIG.F_* bool, re-filters the open stream,
+        -- and refreshes the sidebar list. (mkTog/mkLabel are local to this block -> no main-chunk local.)
+        local function mkTog(field, label, x, w)
+            local tb = catBar:CreateChildWidget("button", "ftog_" .. field, 0, true)
+            tb:SetExtent(w, 20); tb:AddAnchor("LEFT", catBar, x, 0)
+            local bg = tb:CreateColorDrawable(0, 0, 0, 1, "background")
+            bg:AddAnchor("TOPLEFT", tb, 0, 0); bg:AddAnchor("BOTTOMRIGHT", tb, 0, 0)
+            tb:SetText(label)
+            if tb.style then tb.style:SetAlign(ALIGN.CENTER); tb.style:SetFontSize(12) end
+            local function refresh()
+                if CONFIG[field] ~= false then bg:SetColor(0.15, 0.33, 0.18, 1); tb:SetTextColor(0.8, 1, 0.8, 1)
+                else bg:SetColor(0.16, 0.16, 0.16, 1); tb:SetTextColor(0.5, 0.5, 0.5, 1) end
+            end
+            refresh()
+            tb:SetHandler("OnClick", function()
+                CONFIG[field] = not CONFIG[field]
+                refresh(); SaveSettings(); UpdateSessionList()
+                if CONFIG._viewingOverall and CONFIG._buildOverall then
+                    viewingMode = "ARCHIVE"
+                    displayBuffer = ExpandArchive(CONFIG._buildView(CONFIG._viewingOverall))
+                    logScrollOffset = math.max(0, #displayBuffer - CONFIG.VISIBLE_ROWS_HIST)
+                    UpdateHistoryDisplay()
+                end
+            end)
+        end
+        local function mkLabel(text, x, w)
+            local l = catBar:CreateChildWidget("label", "flbl_" .. (string.gsub(text, "%W", "")), 0, true)
+            l:SetText(text); l:SetExtent(w, 28); l:AddAnchor("LEFT", catBar, x, 0)
+            if l.style then l.style:SetAlign(ALIGN.LEFT); l.style:SetColor(0.6, 0.6, 0.6, 1); l.style:SetFontSize(12) end
+        end
+        -- Leading title so it's obvious what this bar is for.
+        local fTitle = catBar:CreateChildWidget("label", "flblTitle", 0, true)
+        fTitle:SetText("Combat Filters"); fTitle:SetExtent(104, 28); fTitle:AddAnchor("LEFT", catBar, 8, 0)
+        if fTitle.style then fTitle.style:SetAlign(ALIGN.LEFT); fTitle.style:SetColor(0.55, 0.8, 1, 1); fTitle.style:SetFontSize(13) end
+        mkLabel("WHO:",  120, 34)
+        mkTog("F_WHO_ME",    "Me",    156, 46)
+        mkTog("F_WHO_ALLY",  "Ally",  204, 48)
+        mkTog("F_WHO_ENEMY", "Enemy", 254, 58)
+        mkTog("F_WHO_MOB",   "Mob",   314, 46)
+        mkLabel("TYPE:", 372, 40)
+        mkTog("F_WHAT_DMG",  "Damage",  414, 66)
+        mkTog("F_WHAT_HEAL", "Healing", 482, 66)
+        mkLabel("DIRECTION:", 560, 76)
+        mkTog("F_DIR_DEALT", "Dealt", 638, 54)
+        mkTog("F_DIR_TAKEN", "Taken", 694, 54)
+    end
+
+    local histSidebar = wHistory:CreateChildWidget("emptywidget", "hSide", 0, true)
+    histSidebar:AddAnchor("TOPLEFT", catBar, "BOTTOMLEFT", 0, 0)
+    histSidebar:SetExtent(CONFIG.SIDEBAR_WIDTH, CONFIG.HIST_HEIGHT - 58)
+    CreateBackdrop(histSidebar, COL_SIDEBAR)
+    histSidebar:EnableDrag(true)
+    histSidebar:SetHandler("OnMouseWheel", function(self, d) ScrollSession(d) end)
+
+    lblSessionCount = histSidebar:CreateChildWidget("label", "lblCount", 0, true)
+    lblSessionCount:SetText("Saved: 0")
+    -- Anchored to the right of the Back button so long names don't overlap it
+    lblSessionCount:AddAnchor("TOPLEFT", histSidebar, 64, 6)
+    lblSessionCount:SetExtent(CONFIG.SIDEBAR_WIDTH - 72, 20)
+    if lblSessionCount.style then lblSessionCount.style:SetAlign(ALIGN.CENTER); lblSessionCount.style:SetColor(0.6, 0.6, 0.6, 1) end
+
+    -- Back button (top-left of sidebar), shown only when viewing one name's sessions
+    sidebarBackBtn = histSidebar:CreateChildWidget("button", "sBack", 0, true)
+    sidebarBackBtn:AddAnchor("TOPLEFT", histSidebar, 5, 4)
+    sidebarBackBtn:SetExtent(54, 20)
+    sidebarBackBtn:SetText("< Back")
+    sidebarBackBtn:SetHandler("OnClick", function()
+        if selectedContributor then
+            selectedContributor = nil          -- Level 3 -> Level 2
+        else
+            sidebarMode = "NAMES"; selectedGroup = nil   -- Level 2 -> Level 1
+        end
+        sessionScrollOffset = 0
+        UpdateSessionList()
+    end)
+    sidebarBackBtn:Show(false)
+
+    local btnLive = histSidebar:CreateChildWidget("button", "btnLive", 0, true)
+    btnLive:AddAnchor("TOP", histSidebar, 0, 30)
+    btnLive:SetExtent(CONFIG.BUTTON_WIDTH, 28)
+    local lbg = btnLive:CreateColorDrawable(0.20, 0.20, 0.20, 1, "background")
+    lbg:AddAnchor("TOPLEFT", btnLive, 0, 1)
+    lbg:AddAnchor("BOTTOMRIGHT", btnLive, 0, -1)
+    btnLive:SetText("Live Log")
+    btnLive:SetTextColor(0.6, 1, 0.6, 1)
+    btnLive:SetHandler("OnClick", function() viewingMode = "LIVE"; CONFIG._viewingOverall = nil; displayBuffer = {}; for _,v in ipairs(masterBuffer) do table.insert(displayBuffer, v) end; logScrollOffset = #displayBuffer - CONFIG.VISIBLE_ROWS_HIST; if logScrollOffset < 0 then logScrollOffset = 0 end; UpdateHistoryDisplay() end)
+
+    for i = 1, CONFIG.SESSIONS_VISIBLE do
+        local btn = histSidebar:CreateChildWidget("button", "SessBtn"..i, 0, true)
+        btn:SetExtent(CONFIG.BUTTON_WIDTH, 24)
+        btn:AddAnchor("TOP", histSidebar, 0, 70 + ((i-1)*26))
+        -- Subtle raised backdrop so each entry reads as a button/tab
+        local sbg = btn:CreateColorDrawable(0.17, 0.17, 0.17, 1, "background")
+        sbg:AddAnchor("TOPLEFT", btn, 0, 1)
+        sbg:AddAnchor("BOTTOMRIGHT", btn, 0, -1)
+        if btn.style then btn.style:SetAlign(ALIGN.LEFT) end
+        -- NOTE: these icons are parented to the SIDEBAR (an emptywidget), not the button --
+        -- a clickable icon nested inside a button never receives its own OnClick (the button
+        -- eats the click). Anchored onto the button so they still track its row.
+        -- Icons sit in the sidebar's side MARGINS (the button is 180 wide in a 230 sidebar, so
+        -- ~25px of clear space each side), NOT over the button -- an icon overlapping a button
+        -- never receives its own click. Parented to the sidebar (emptywidget), anchored to the
+        -- button edges so they track each row.
+        btn.clpIcon = ClpMakeIcon(histSidebar, 22)  -- match the skull marker (clpMarkIcon, 22)
+        if btn.clpIcon then
+            btn.clpIcon:AddAnchor("LEFT", btn, 4, 0); btn.clpIcon:Show(false)  -- inside the box's left edge
+            -- Clicking a name icon (mobs only -- key set during render) opens the picker.
+            pcall(function() btn.clpIcon:SetHandler("OnClick", function()
+                if btn.clpIconKey and CONFIG._openIconPicker then CONFIG._openIconPicker(btn.clpIconKey) end
+            end) end)
+        end
+        -- KILL/DIED marker icon, INSIDE the button at the right end (clear of the scroll buttons
+        -- in the right margin). Display-only there -- the button captures the click, so clicking
+        -- this row (marker included) drills into the session. The kill/death icons are assignable
+        -- from Options instead.
+        btn.clpMarkIcon = ClpMakeIcon(histSidebar, 22)
+        if btn.clpMarkIcon then
+            btn.clpMarkIcon:AddAnchor("RIGHT", btn, -4, 0); btn.clpMarkIcon:Show(false)
+        end
+        -- Fight-row sub-labels (children of the button, so they ride its z-order; no clicks needed):
+        -- bright duration (left), faint time (right), death count just left of the skull so "N [skull]"
+        -- reads as "N deaths". Hidden except on fight rows.
+        btn.durLabel = btn:CreateChildWidget("label", "sdur" .. i, 0, true)
+        btn.durLabel:SetExtent(70, 24); btn.durLabel:AddAnchor("LEFT", btn, 30, 0)
+        if btn.durLabel.style then btn.durLabel.style:SetAlign(ALIGN.LEFT) end
+        btn.durLabel:Show(false)
+        btn.timeLabel = btn:CreateChildWidget("label", "stime" .. i, 0, true)
+        btn.timeLabel:SetExtent(40, 24); btn.timeLabel:AddAnchor("RIGHT", btn, -54, 0)
+        if btn.timeLabel.style then btn.timeLabel.style:SetAlign(ALIGN.RIGHT); btn.timeLabel.style:SetFontSize(11); btn.timeLabel.style:SetColor(0.45, 0.45, 0.45, 1) end
+        btn.timeLabel:Show(false)
+        btn.deathLabel = btn:CreateChildWidget("label", "sdth" .. i, 0, true)
+        btn.deathLabel:SetExtent(22, 24); btn.deathLabel:AddAnchor("RIGHT", btn, -28, 0)
+        if btn.deathLabel.style then btn.deathLabel.style:SetAlign(ALIGN.RIGHT); btn.deathLabel.style:SetFontSize(12) end
+        btn.deathLabel:Show(false)
+        -- Up to 3 skillset (class) icons from the game HUD atlas (same method as the
+        -- role_identifier addon). Shown instead of the single role glyph when we know the
+        -- player's build. TEXTURE_PATH is a game global; guarded so absence is harmless.
+        btn.clpSkill = {}
+        if TEXTURE_PATH and TEXTURE_PATH.HUD then
+            for j = 1, 3 do
+                local ok, d = pcall(function() return btn:CreateImageDrawable(TEXTURE_PATH.HUD, "overlay") end)
+                if ok and d then
+                    d:SetExtent(13, 13); d:AddAnchor("LEFT", btn, 3 + (j - 1) * 14, 0)
+                    pcall(function() d:SetSRGB(false) end)
+                    d:SetVisible(false)
+                    btn.clpSkill[j] = d
+                end
+            end
+        end
+        btn:SetText("")
+        btn:Show(false)
+        btn:SetHandler("OnClick", function(self)
+            if self.drillContributor then
+                -- Level 2 -> Level 3: drill into a multi-instance contributor's same-named units.
+                selectedContributor = self.drillContributor
+                sessionScrollOffset = 0
+                UpdateSessionList()
+            elseif self.drillGroup then
+                -- Level 1 -> Level 2: drill into the fight/Overall and show its stream in the body.
+                selectedGroup = self.drillGroup
+                selectedContributor = nil
+                sidebarMode = "SESSIONS"
+                sessionScrollOffset = 0
+                if CONFIG._buildOverall then
+                    viewingMode = "ARCHIVE"
+                    CONFIG._viewingOverall = self.drillGroup
+                    displayBuffer = ExpandArchive(CONFIG._buildView(self.drillGroup))
+                    logScrollOffset = math.max(0, #displayBuffer - CONFIG.VISIBLE_ROWS_HIST)
+                end
+                UpdateSessionList()
+                UpdateHistoryDisplay()
+            elseif self.viewGroup and CONFIG._buildOverall then
+                -- View a scope-Overall or a single contributor's combat in the body.
+                viewingMode = "ARCHIVE"
+                CONFIG._viewingOverall = self.viewGroup
+                displayBuffer = ExpandArchive(CONFIG._buildView(self.viewGroup))
+                logScrollOffset = math.max(0, #displayBuffer - CONFIG.VISIBLE_ROWS_HIST)
+                UpdateHistoryDisplay()
+            end
+        end)
+        btn:SetHandler("OnMouseWheel", function(self, d) ScrollSession(d) end)
+        sessionButtons[i] = btn
+    end
+
+    local btnClear = histSidebar:CreateChildWidget("button", "btnClear", 0, true)
+    btnClear:AddAnchor("BOTTOM", histSidebar, 0, -10)
+    btnClear:SetExtent(CONFIG.BUTTON_WIDTH, 24)
+    btnClear:SetText("CLEAR ALL")
+    if btnClear.style then btnClear.style:SetColor(COL_BTN_RED[1], COL_BTN_RED[2], COL_BTN_RED[3], 1) end
+    btnClear:SetHandler("OnClick", ClearAll)
+    local btnSessUp = histSidebar:CreateChildWidget("button", "btnSUp", 0, true)
+    btnSessUp:AddAnchor("TOPRIGHT", histSidebar, -5, 70)
+    btnSessUp:SetExtent(14, 40)
+    btnSessUp:SetText("^")
+    btnSessUp:SetHandler("OnClick", function() ScrollSession(1) end)
+    local btnSessDown = histSidebar:CreateChildWidget("button", "btnSDown", 0, true)
+    btnSessDown:AddAnchor("BOTTOMRIGHT", histSidebar, -5, -40)
+    btnSessDown:SetExtent(14, 40)
+    btnSessDown:SetText("v")
+    btnSessDown:SetHandler("OnClick", function() ScrollSession(-1) end)
+
+    -- Draggable scrollbar for the session list, between its up/down arrows (same as the log's).
+    sessTrack = histSidebar:CreateChildWidget("emptywidget", "ssTrack", 0, true)
+    sessTrack:AddAnchor("TOPRIGHT", btnSessUp, "BOTTOMRIGHT", 0, 4)
+    sessTrack:SetExtent(14, CONFIG.HIST_HEIGHT - 256)
+    CreateBackdrop(sessTrack, { 0.08, 0.08, 0.08, 0.55 })
+    sessThumb = sessTrack:CreateChildWidget("button", "ssThumb", 0, true)
+    sessThumb:SetExtent(8, 40)
+    sessThumb:AddAnchor("TOP", sessTrack, 0, 0)
+    CreateBackdrop(sessThumb, { 0.55, 0.55, 0.6, 0.95 })
+    sessThumb:EnableDrag(true)
+    sessThumb:SetHandler("OnDragStart", function()
+        CONFIG._sessDragging = true
+        local _, my = api.Input:GetMousePos()
+        CONFIG._sessDragStartMouseY = my or 0
+        local range = CONFIG._sessRange or 0
+        local maxScroll = CONFIG._sessMaxScroll or 0
+        CONFIG._sessDragStartThumbY = (maxScroll > 0 and range > 0) and (sessionScrollOffset / maxScroll) * range or 0
+    end)
+    sessThumb:SetHandler("OnDragStop", function() CONFIG._sessDragging = false end)
+    sessThumb:SetHandler("OnUpdate", function()
+        if not CONFIG._sessDragging then return end
+        local range = CONFIG._sessRange or 0
+        if range <= 0 then return end
+        local _, my = api.Input:GetMousePos()
+        if not my then return end
+        local newY = (CONFIG._sessDragStartThumbY or 0) + (my - (CONFIG._sessDragStartMouseY or my))
+        if newY < 0 then newY = 0 elseif newY > range then newY = range end
+        local maxScroll = CONFIG._sessMaxScroll or 0
+        sessionScrollOffset = math.floor((newY / range) * maxScroll + 0.5)
+        UpdateSessionList()
+    end)
+    UpdateSessionThumb()
+
+    local histBody = wHistory:CreateChildWidget("emptywidget", "hBody", 0, true)
+    histBody:AddAnchor("TOPLEFT", histSidebar, "TOPRIGHT", 0, 0)
+    histBody:AddAnchor("BOTTOMRIGHT", wHistory, 0, 0)
+    CreateBackdrop(histBody, COL_LOG_BG)
+    for i = 1, CONFIG.VISIBLE_ROWS_HIST do
+        local btn = histBody:CreateChildWidget("label", "HL"..i, 0, true)
+        btn:SetExtent(CONFIG.HIST_WIDTH - CONFIG.SIDEBAR_WIDTH - 64, CONFIG.HIST_ROW_H)  -- -64 clears the scrollbar
+        btn:AddAnchor("TOPLEFT", histBody, 32, 8 + ((i-1) * CONFIG.HIST_ROW_H))
+        if btn.SetLimitWidth then btn:SetLimitWidth(true) end
+        if btn.style then
+            btn.style:SetAlign(ALIGN.LEFT)
+            btn.style:SetShadow(true)
+            btn.style:SetEllipsis(true)
+        end
+        historyLabels[i] = btn
+        -- Raid Meter bar: a colored fill on the body's BACKGROUND layer (renders behind the text
+        -- labels), width re-anchored per render to the row's contribution. Created 0-width (hidden);
+        -- only the Raid Meter view sets entry.barPct. All render ops are pcall-guarded.
+        CONFIG._histBars = CONFIG._histBars or {}
+        local barD = histBody:CreateColorDrawable(0.235, 0.45, 0.62, 0.32, "background")
+        barD:AddAnchor("TOPLEFT", histBody, 32, 8 + ((i-1) * CONFIG.HIST_ROW_H) + 2)
+        barD:AddAnchor("BOTTOMRIGHT", histBody, "TOPLEFT", 32, 8 + ((i-1) * CONFIG.HIST_ROW_H) + CONFIG.HIST_ROW_H - 2)
+        barD.clpBarW = 0
+        CONFIG._histBars[i] = barD
+        -- Ally-recap rows split the line around an inline icon: a right-aligned LEFT label
+        -- ("[time] Source —>") so the arrow hugs the icon column, then a left-aligned RIGHT
+        -- label ("Skill ±N [HP%]") after it. Stored on CONFIG (no new top-level locals).
+        CONFIG._recapL = CONFIG._recapL or {}
+        CONFIG._recapR = CONFIG._recapR or {}
+        local rL = histBody:CreateChildWidget("label", "HLrL"..i, 0, true)
+        rL:SetExtent(CONFIG.RECAP_ICON_X - 7, CONFIG.HIST_ROW_H)
+        rL:AddAnchor("TOPLEFT", histBody, 5, 8 + ((i-1) * CONFIG.HIST_ROW_H))
+        if rL.SetLimitWidth then rL:SetLimitWidth(true) end
+        if rL.style then rL.style:SetAlign(ALIGN.RIGHT); rL.style:SetShadow(true) end
+        rL:Show(false); CONFIG._recapL[i] = rL
+        local rR = histBody:CreateChildWidget("label", "HLrR"..i, 0, true)
+        rR:SetExtent(CONFIG.HIST_WIDTH - CONFIG.SIDEBAR_WIDTH - CONFIG.RECAP_ICON_X - 60, CONFIG.HIST_ROW_H)
+        rR:AddAnchor("TOPLEFT", histBody, CONFIG.RECAP_ICON_X + 26, 8 + ((i-1) * CONFIG.HIST_ROW_H))
+        if rR.SetLimitWidth then rR:SetLimitWidth(true) end
+        if rR.style then rR.style:SetAlign(ALIGN.LEFT); rR.style:SetShadow(true); rR.style:SetEllipsis(true) end
+        rR:Show(false); CONFIG._recapR[i] = rR
+        historyIcons[i] = ClpMakeIcon(histBody, 22)
+        if historyIcons[i] then
+            CONFIG._histBody = histBody
+            historyIcons[i]:AddAnchor("TOPLEFT", histBody, 5, 9 + ((i-1) * CONFIG.HIST_ROW_H))
+            historyIcons[i].clpIconX = 5
+            historyIcons[i]:Show(false)
+            -- Click an icon (or blank slot) to reassign it via the picker. The skill name is
+            -- stamped on the widget during render; the picker writes icon_overrides.txt.
+            pcall(function() historyIcons[i]:SetHandler("OnClick", function(self)
+                if self.clpSkill and CONFIG._openIconPicker then CONFIG._openIconPicker(self.clpSkill) end
+            end) end)
+        end
+    end
+    local btnUp = histBody:CreateChildWidget("button", "bUp", 0, true)
+    btnUp:AddAnchor("TOPRIGHT", histBody, -5, 5)
+    btnUp:SetExtent(14, 40)
+    btnUp:SetText("^")
+    btnUp:SetHandler("OnClick", ScrollLogUp)
+    local btnDown = histBody:CreateChildWidget("button", "bDown", 0, true)
+    btnDown:AddAnchor("BOTTOMRIGHT", histBody, -5, -5)
+    btnDown:SetExtent(14, 40)
+    btnDown:SetText("v")
+    btnDown:SetHandler("OnClick", ScrollLogDown)
+    histBody:EnableDrag(true)
+    histBody:SetHandler("OnMouseWheel", function(self, d) if d>0 then ScrollLogUp() else ScrollLogDown() end end)
+
+    -- Draggable scrollbar between the up/down arrows. (AA grabs the mouse wheel for camera zoom, so
+    -- the arrows + this bar are the only ways to scroll.) The thumb shows position + size and can be
+    -- dragged; driven off the cursor Y (api.Input:GetMousePos) via a start-offset + mouse delta,
+    -- since AA has no clean cursor-to-widget mapping.
+    scrollTrack = histBody:CreateChildWidget("emptywidget", "scTrack", 0, true)
+    scrollTrack:AddAnchor("TOPRIGHT", btnUp, "BOTTOMRIGHT", 0, 4)
+    scrollTrack:SetExtent(14, CONFIG.HIST_HEIGHT - 156)
+    CreateBackdrop(scrollTrack, { 0.08, 0.08, 0.08, 0.55 })
+    scrollThumb = scrollTrack:CreateChildWidget("button", "scThumb", 0, true)
+    scrollThumb:SetExtent(8, 40)
+    scrollThumb:AddAnchor("TOP", scrollTrack, 0, 0)
+    CreateBackdrop(scrollThumb, { 0.55, 0.55, 0.6, 0.95 })
+    scrollThumb:EnableDrag(true)
+    scrollThumb:SetHandler("OnDragStart", function()
+        CONFIG._scrollDragging = true
+        local _, my = api.Input:GetMousePos()
+        CONFIG._dragStartMouseY = my or 0
+        local range = CONFIG._scrollRange or 0
+        local maxOffset = math.max(0, #displayBuffer - CONFIG.VISIBLE_ROWS_HIST)
+        CONFIG._dragStartThumbY = (maxOffset > 0 and range > 0) and (logScrollOffset / maxOffset) * range or 0
+    end)
+    scrollThumb:SetHandler("OnDragStop", function() CONFIG._scrollDragging = false end)
+    scrollThumb:SetHandler("OnUpdate", function()
+        if not CONFIG._scrollDragging then return end
+        local range = CONFIG._scrollRange or 0
+        if range <= 0 then return end
+        local _, my = api.Input:GetMousePos()
+        if not my then return end
+        local newY = (CONFIG._dragStartThumbY or 0) + (my - (CONFIG._dragStartMouseY or my))
+        if newY < 0 then newY = 0 elseif newY > range then newY = range end
+        local maxOffset = math.max(0, #displayBuffer - CONFIG.VISIBLE_ROWS_HIST)
+        logScrollOffset = math.floor((newY / range) * maxOffset + 0.5)
+        UpdateHistoryDisplay()
+    end)
+    UpdateScrollThumb()
 end
 
 local function Load()
@@ -3596,10 +6318,11 @@ local function Load()
     TIME_INITIALIZED = false
     LoadSavedSettings()
 
-    -- === SMALL TOGGLE BUTTON (always visible, Shift+Drag to move) ===
+    -- === SMALL TOGGLE PANEL (always visible, Shift+Drag to move): titled header + Live | History ===
+    -- One housing: a thin "Combat Log Pro" header over two segments split by a seam.
     wButton = api.Interface:CreateEmptyWindow("CLPBtn", "UIParent")
     wButton:Show(true)
-    wButton:SetExtent(50, 24)
+    wButton:SetExtent(112, 37)
     if savedSettings.btnX then
         wButton:AddAnchor("TOPLEFT", "UIParent", savedSettings.btnX, savedSettings.btnY)
     else
@@ -3607,12 +6330,52 @@ local function Load()
     end
     CreateBackdrop(wButton, {0.15, 0.15, 0.15, 0.9})
 
+    -- Thin title header (drag here to move the panel).
+    local btnHeader = wButton:CreateChildWidget("emptywidget", "clpBtnHdr", 0, true)
+    btnHeader:AddAnchor("TOPLEFT", wButton, 0, 0)
+    btnHeader:AddAnchor("TOPRIGHT", wButton, 0, 0)
+    btnHeader:SetHeight(13)
+    CreateBackdrop(btnHeader, COL_HEADER)
+    MakeDraggable(btnHeader, wButton, SaveSettings)
+    local btnTitle = btnHeader:CreateChildWidget("label", "clpBtnTitle", 0, true)
+    btnTitle:AddAnchor("CENTER", btnHeader, 0, 0)
+    btnTitle:SetExtent(110, 13)
+    btnTitle:SetText("Combat Log Pro")
+    if btnTitle.style then btnTitle.style:SetAlign(ALIGN.CENTER); btnTitle.style:SetFontSize(9); btnTitle.style:SetColor(0.72, 0.72, 0.78, 1) end
+    MakeDraggable(btnTitle, wButton, SaveSettings)
+
+    -- Both segments share one scheme so they always match: green = its window open, grey = closed.
+    -- Left segment: Live (toggles the live combat feed).
     local toggleBtn = wButton:CreateChildWidget("button", "Toggle", 0, true)
-    toggleBtn:AddAnchor("TOPLEFT", wButton, 0, 0)
-    toggleBtn:AddAnchor("BOTTOMRIGHT", wButton, 0, 0)
-    toggleBtn:SetText("CLP")
+    toggleBtn:AddAnchor("TOPLEFT", btnHeader, "BOTTOMLEFT", 0, 0)
+    toggleBtn:SetExtent(52, 24)
+    toggleBtn:SetText("Live")
     toggleBtn:SetTextColor(0, 1, 0, 1)
     MakeDraggable(toggleBtn, wButton, SaveSettings)
+
+    -- Right segment: History (toggles the history window). Reachable even when Live is closed.
+    local histBtn = wButton:CreateChildWidget("button", "HistBtn", 0, true)
+    histBtn:AddAnchor("TOPRIGHT", btnHeader, "BOTTOMRIGHT", 0, 0)
+    histBtn:SetExtent(56, 24)
+    histBtn:SetText("History")
+    histBtn:SetTextColor(0.5, 0.5, 0.5, 1)  -- history starts closed -> grey
+    MakeDraggable(histBtn, wButton, SaveSettings)
+    -- Keep the History segment's colour in sync with the window from any of its toggle points.
+    CONFIG._histBtn = histBtn
+    CONFIG._refreshHistBtn = function()
+        if not CONFIG._histBtn then return end
+        if wHistory and wHistory:IsVisible() then CONFIG._histBtn:SetTextColor(0, 1, 0, 1)
+        else CONFIG._histBtn:SetTextColor(0.5, 0.5, 0.5, 1) end
+    end
+    histBtn:SetHandler("OnClick", function()
+        wHistory:Show(not wHistory:IsVisible()); UpdateHistoryDisplay(); UpdateSessionList()
+        CONFIG._refreshHistBtn()
+    end)
+
+    -- Seam: a thin vertical line in the gap so the two segments read as connected-but-separate.
+    local btnSeam = wButton:CreateColorDrawable(0.4, 0.4, 0.4, 1, "overlay")
+    btnSeam:AddAnchor("TOPLEFT", toggleBtn, "TOPRIGHT", 1, 3)
+    btnSeam:AddAnchor("BOTTOMRIGHT", histBtn, "BOTTOMLEFT", -1, -3)
 
     -- === LIVE LOG WINDOW (detached, toggled by button or X) ===
     wLive = api.Interface:CreateEmptyWindow("LiveWin", "UIParent")
@@ -3633,11 +6396,20 @@ local function Load()
     MakeDraggable(liveHeader, wLive, SaveSettings)
 
     liveTitleLabel = liveHeader:CreateChildWidget("label", "Title", 0, true)
-    liveTitleLabel:AddAnchor("LEFT", liveHeader, 10, 0)
-    liveTitleLabel:SetExtent(200, 20)
-    liveTitleLabel:SetText("Combat Log [Idle]")
-    if liveTitleLabel.style then liveTitleLabel.style:SetAlign(ALIGN.LEFT); liveTitleLabel.style:SetColor(0.7, 0.7, 0.7, 1) end
+    liveTitleLabel:AddAnchor("LEFT", liveHeader, 12, 0)
+    liveTitleLabel:SetExtent(105, 30)
+    liveTitleLabel:SetText("Combat Log")
+    if liveTitleLabel.style then liveTitleLabel.style:SetAlign(ALIGN.LEFT); liveTitleLabel.style:SetFontSize(15); liveTitleLabel.style:SetColor(0.9, 0.9, 0.9, 1) end
     MakeDraggable(liveTitleLabel, wLive, SaveSettings)
+
+    -- Status badge stored on the title label (avoids a new file-level Load upvalue)
+    local liveStatus = liveHeader:CreateChildWidget("label", "Status", 0, true)
+    liveStatus:AddAnchor("LEFT", liveTitleLabel, "RIGHT", 4, 0)
+    liveStatus:SetExtent(90, 30)
+    liveStatus:SetText("IDLE")
+    if liveStatus.style then liveStatus.style:SetAlign(ALIGN.LEFT); liveStatus.style:SetFontSize(11); liveStatus.style:SetColor(0.45, 0.45, 0.45, 1) end
+    MakeDraggable(liveStatus, wLive, SaveSettings)
+    liveTitleLabel.statusLabel = liveStatus
 
     local btnHide = liveHeader:CreateChildWidget("button", "btnHide", 0, true)
     btnHide:AddAnchor("RIGHT", liveHeader, -5, 0)
@@ -3647,23 +6419,31 @@ local function Load()
         wLive:Show(false)
         isMinimized = true
         toggleBtn:SetTextColor(0.5, 0.5, 0.5, 1)
+        CONFIG.LIVE_OPEN = false; SaveSettings()  -- remember closed for next login
     end)
 
-    local btnOp = liveHeader:CreateChildWidget("button", "btnOp", 0, true)
-    btnOp:AddAnchor("RIGHT", btnHide, "LEFT", -5, 0)
-    btnOp:SetExtent(60, 24)
+    -- History + Options live in a bottom FOOTER (moved out of the header) so the IDLE/IN COMBAT
+    -- badge always has room up top -- it used to hide when the window was below ~360px wide.
+    local liveFooter = wLive:CreateChildWidget("emptywidget", "lFooter", 0, true)
+    liveFooter:AddAnchor("BOTTOMLEFT", wLive, 0, 0)
+    liveFooter:AddAnchor("BOTTOMRIGHT", wLive, 0, 0)
+    liveFooter:SetHeight(26)
+    CreateBackdrop(liveFooter, COL_HEADER)
+    MakeDraggable(liveFooter, wLive, SaveSettings)
+
+    local btnHist = liveFooter:CreateChildWidget("button", "btnHist", 0, true)
+    btnHist:SetExtent(82, 22); btnHist:AddAnchor("LEFT", liveFooter, 8, 0)
+    btnHist:SetText("History")
+    btnHist:SetHandler("OnClick", function() wHistory:Show(not wHistory:IsVisible()); UpdateHistoryDisplay(); UpdateSessionList(); if CONFIG._refreshHistBtn then CONFIG._refreshHistBtn() end end)
+
+    local btnOp = liveFooter:CreateChildWidget("button", "btnOp", 0, true)
+    btnOp:SetExtent(82, 22); btnOp:AddAnchor("LEFT", btnHist, "RIGHT", 6, 0)
     btnOp:SetText("Options")
     btnOp:SetHandler("OnClick", function() if not wOptions then CreateOptionsWindow() end; wOptions:Show(not wOptions:IsVisible()) end)
 
-    local btnHist = liveHeader:CreateChildWidget("button", "btnHist", 0, true)
-    btnHist:AddAnchor("RIGHT", btnOp, "LEFT", -5, 0)
-    btnHist:SetExtent(60, 24)
-    btnHist:SetText("History")
-    btnHist:SetHandler("OnClick", function() wHistory:Show(not wHistory:IsVisible()); UpdateHistoryDisplay(); UpdateSessionList() end)
-
     liveBodyWidget = wLive:CreateChildWidget("emptywidget", "lBody", 0, true)
     liveBodyWidget:AddAnchor("TOPLEFT", liveHeader, "BOTTOMLEFT", 0, 0)
-    liveBodyWidget:AddAnchor("BOTTOMRIGHT", wLive, 0, 0)
+    liveBodyWidget:AddAnchor("BOTTOMRIGHT", liveFooter, "TOPRIGHT", 0, 0)
     CreateBackdrop(liveBodyWidget, COL_BODY)
     MakeDraggable(liveBodyWidget, wLive, SaveSettings)
     RebuildLiveLabels()
@@ -3674,130 +6454,42 @@ local function Load()
             wLive:Show(false)
             isMinimized = true
             toggleBtn:SetTextColor(0.5, 0.5, 0.5, 1)
+            CONFIG.LIVE_OPEN = false
         else
             wLive:Show(true)
             isMinimized = false
             toggleBtn:SetTextColor(0, 1, 0, 1)
+            CONFIG.LIVE_OPEN = true
         end
+        SaveSettings()  -- remember open/closed for next login
     end)
 
-    -- === HISTORY WINDOW ===
-    wHistory = api.Interface:CreateEmptyWindow("HistWin", "UIParent")
-    wHistory:Show(false)
-    wHistory:SetExtent(CONFIG.HIST_WIDTH, CONFIG.HIST_HEIGHT)
-    wHistory:AddAnchor("CENTER", "UIParent", 0, 0)
-
-    local histHeader = wHistory:CreateChildWidget("emptywidget", "hHeader", 0, true)
-    histHeader:AddAnchor("TOPLEFT", wHistory, 0, 0)
-    histHeader:AddAnchor("TOPRIGHT", wHistory, 0, 0)
-    histHeader:SetHeight(30)
-    CreateBackdrop(histHeader, COL_HEADER)
-    MakeDraggable(histHeader, wHistory)
-    local histTitle = histHeader:CreateChildWidget("label", "hTitle", 0, true)
-    histTitle:SetText("Session History")
-    histTitle:AddAnchor("CENTER", histHeader, 0, 0)
-    if histTitle.style then histTitle.style:SetFontSize(15) end
-    MakeDraggable(histTitle, wHistory)
-    local btnClose = histHeader:CreateChildWidget("button", "close", 0, true)
-    btnClose:AddAnchor("RIGHT", histHeader, -5, 0)
-    btnClose:SetExtent(30, 24)
-    btnClose:SetText("X")
-    btnClose:SetHandler("OnClick", function() wHistory:Show(false) end)
-
-    local histSidebar = wHistory:CreateChildWidget("emptywidget", "hSide", 0, true)
-    histSidebar:AddAnchor("TOPLEFT", histHeader, "BOTTOMLEFT", 0, 0)
-    histSidebar:SetExtent(CONFIG.SIDEBAR_WIDTH, CONFIG.HIST_HEIGHT - 30)
-    CreateBackdrop(histSidebar, COL_SIDEBAR)
-    histSidebar:EnableDrag(true)
-    histSidebar:SetHandler("OnMouseWheel", function(self, d) ScrollSession(d) end)
-
-    lblSessionCount = histSidebar:CreateChildWidget("label", "lblCount", 0, true)
-    lblSessionCount:SetText("Saved: 0")
-    lblSessionCount:AddAnchor("TOP", histSidebar, 0, 5)
-    if lblSessionCount.style then lblSessionCount.style:SetAlign(ALIGN.CENTER); lblSessionCount.style:SetColor(0.6, 0.6, 0.6, 1) end
-
-    local btnLive = histSidebar:CreateChildWidget("button", "btnLive", 0, true)
-    btnLive:AddAnchor("TOP", histSidebar, 0, 30)
-    btnLive:SetExtent(CONFIG.BUTTON_WIDTH, 30)
-    btnLive:SetText(">> LIVE LOG <<")
-    btnLive:SetHandler("OnClick", function() viewingMode = "LIVE"; displayBuffer = {}; for _,v in ipairs(masterBuffer) do table.insert(displayBuffer, v) end; logScrollOffset = #displayBuffer - CONFIG.VISIBLE_ROWS_HIST; if logScrollOffset < 0 then logScrollOffset = 0 end; UpdateHistoryDisplay() end)
-
-    for i = 1, CONFIG.SESSIONS_VISIBLE do
-        local btn = histSidebar:CreateChildWidget("button", "SessBtn"..i, 0, true)
-        btn:SetExtent(CONFIG.BUTTON_WIDTH, 24)
-        btn:AddAnchor("TOP", histSidebar, 0, 70 + ((i-1)*28))
-        btn:SetText("")
-        btn:Show(false)
-        btn:SetHandler("OnClick", function(self)
-            local sess = allSessions[self.sessionIndex]
-            if not sess then return end
-            viewingMode = "ARCHIVE"
-            displayBuffer = sess.logs
-            logScrollOffset = math.max(0, #displayBuffer - CONFIG.VISIBLE_ROWS_HIST)
-            UpdateHistoryDisplay()
-        end)
-        btn:SetHandler("OnMouseWheel", function(self, d) ScrollSession(d) end)
-        sessionButtons[i] = btn
+    -- Restore last session's open/closed state (default open). Closed = start minimized.
+    if CONFIG.LIVE_OPEN == false then
+        wLive:Show(false)
+        isMinimized = true
+        toggleBtn:SetTextColor(0.5, 0.5, 0.5, 1)
     end
 
-    local btnClear = histSidebar:CreateChildWidget("button", "btnClear", 0, true)
-    btnClear:AddAnchor("BOTTOM", histSidebar, 0, -10)
-    btnClear:SetExtent(CONFIG.BUTTON_WIDTH, 24)
-    btnClear:SetText("CLEAR ALL")
-    if btnClear.style then btnClear.style:SetColor(COL_BTN_RED[1], COL_BTN_RED[2], COL_BTN_RED[3], 1) end
-    btnClear:SetHandler("OnClick", ClearAll)
-    local btnSessUp = histSidebar:CreateChildWidget("button", "btnSUp", 0, true)
-    btnSessUp:AddAnchor("TOPRIGHT", histSidebar, -5, 70)
-    btnSessUp:SetExtent(24, 40)
-    btnSessUp:SetText("^")
-    btnSessUp:SetHandler("OnClick", function() ScrollSession(1) end)
-    local btnSessDown = histSidebar:CreateChildWidget("button", "btnSDown", 0, true)
-    btnSessDown:AddAnchor("BOTTOMRIGHT", histSidebar, -5, -40)
-    btnSessDown:SetExtent(24, 40)
-    btnSessDown:SetText("v")
-    btnSessDown:SetHandler("OnClick", function() ScrollSession(-1) end)
-
-    local histBody = wHistory:CreateChildWidget("emptywidget", "hBody", 0, true)
-    histBody:AddAnchor("TOPLEFT", histSidebar, "TOPRIGHT", 0, 0)
-    histBody:AddAnchor("BOTTOMRIGHT", wHistory, 0, 0)
-    CreateBackdrop(histBody, COL_LOG_BG)
-    for i = 1, CONFIG.VISIBLE_ROWS_HIST do
-        local btn = histBody:CreateChildWidget("label", "HL"..i, 0, true)
-        btn:SetExtent(CONFIG.HIST_WIDTH - CONFIG.SIDEBAR_WIDTH - 30, CONFIG.LINE_HEIGHT)
-        btn:AddAnchor("TOPLEFT", histBody, 20, 10 + ((i-1) * CONFIG.LINE_HEIGHT))
-        if btn.SetLimitWidth then btn:SetLimitWidth(true) end
-        if btn.style then
-            btn.style:SetAlign(ALIGN.LEFT)
-            btn.style:SetShadow(true)
-            btn.style:SetEllipsis(true)
-        end
-        historyLabels[i] = btn
-    end
-    local btnUp = histBody:CreateChildWidget("button", "bUp", 0, true)
-    btnUp:AddAnchor("TOPRIGHT", histBody, -5, 5)
-    btnUp:SetExtent(24, 40)
-    btnUp:SetText("^")
-    btnUp:SetHandler("OnClick", ScrollLogUp)
-    local btnDown = histBody:CreateChildWidget("button", "bDown", 0, true)
-    btnDown:AddAnchor("BOTTOMRIGHT", histBody, -5, -5)
-    btnDown:SetExtent(24, 40)
-    btnDown:SetText("v")
-    btnDown:SetHandler("OnClick", ScrollLogDown)
-    histBody:EnableDrag(true)
-    histBody:SetHandler("OnMouseWheel", function(self, d) if d>0 then ScrollLogUp() else ScrollLogDown() end end)
+    CreateHistoryWindow()
 
     -- Events on the always-visible button so combat tracking works when log is hidden
     wButton:SetHandler("OnEvent", OnLiveEvent)
     wButton:SetHandler("OnUpdate", OnLiveUpdate)
     wButton:RegisterEvent("COMBAT_MSG")
     wButton:RegisterEvent("COMBAT_TEXT")  -- provides sourceUnitId to distinguish same-named mobs
+    wButton:RegisterEvent("UNIT_DEAD")    -- authoritative death event for ALL units incl. the local player
     wButton:RegisterEvent("UNIT_COMBAT_STATE_CHANGED")
     wButton:RegisterEvent("TARGET_CHANGED")           -- patch 243+: instant target tracking
     wButton:RegisterEvent("TARGET_TO_TARGET_CHANGED") -- patch 243+: live enemy-targeting-player state
     wButton:RegisterEvent("SPELLCAST_START")          -- patch 243+: cast began
     wButton:RegisterEvent("SPELLCAST_SUCCEEDED")      -- patch 243+: cast completed
     wButton:RegisterEvent("SPELLCAST_STOP")           -- patch 243+: cast interrupted/cancelled
-    LogEntry("CombatLogPro v1.0.1 Loaded (" .. PLAYER_NAME .. ")", 0, 1, 0)
+    pcall(function() wButton:RegisterEvent("HEIR_SKILL_LEARN") end)  -- ancestral variant switched -> update icon
+    pcall(function() wButton:RegisterEvent("HEIR_SKILL_RESET") end)  -- ancestral variant reset -> base icon
+    pcall(CONFIG._loadHeir)                            -- restore persisted ancestral-variant icons (event doesn't fire on login)
+    pcall(BuildPlayerSkillIcons)                       -- name->icon map for your own skills (history)
+    LogEntry("CombatLogPro v2.0.0 Loaded (" .. PLAYER_NAME .. ")", 0, 1, 0, { time = "" })
 end
 
 local function Unload()
